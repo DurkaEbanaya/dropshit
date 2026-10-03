@@ -38,7 +38,7 @@ fi
 systemctl daemon-reload >/dev/null 2>&1 || :
 
 %files
-%license LICENSE
+/usr/share/licenses/dropshit/LICENSE
 /usr/share/doc/dropshit/README.md
 /usr/bin/dropshit
 /usr/libexec/dropshit-helper
