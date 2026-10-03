@@ -6,16 +6,16 @@ Independent GPL-3.0 Rust terminal app for Linux: regional HTTPS latency estimate
 
 Download a package from [Releases](https://github.com/DurkaEbanaya/dropshit/releases):
 
-- Debian 12 / Ubuntu 24.04+: `sudo apt install ./dropshit_0.1.0-1_amd64.deb`
-- Fedora: `sudo dnf install ./dropshit-0.1.0-1.fc.x86_64.rpm`
-- openSUSE Tumbleweed: `sudo zypper --no-gpg-checks install ./dropshit-0.1.0-1.x86_64.rpm` (RPMs are unsigned)
-- Arch Linux: `sudo pacman -U ./dropshit-0.1.0-1-x86_64.pkg.tar.zst`
+- Debian 12 / Ubuntu 24.04+: `sudo apt install ./dropshit_0.1.1-1_amd64.deb`
+- Fedora: `sudo dnf install ./dropshit-0.1.1-1.fc.x86_64.rpm`
+- openSUSE Tumbleweed: `sudo zypper --no-gpg-checks install ./dropshit-0.1.1-1.x86_64.rpm` (RPMs are unsigned)
+- Arch Linux: `sudo pacman -U ./dropshit-0.1.1-1-x86_64.pkg.tar.zst`
 
 Run `dropshit` in a terminal **as your normal user**, never with sudo. A desktop polkit authentication agent is needed for the firewall helper (`pkexec`); on a console without an agent, the firewall commands cannot authenticate. Install `nftables >= 1.0.9` or `iptables` including IPv6 tools; the nftables backend is chosen by default. To force iptables, edit `/etc/dropshit/firewall.json` as root and set `{"backend":"iptables"}`. Keep the previous backend installed until the migration is applied.
 
 ## Controls
 
-`↑` / `↓` (or `j` / `k`) select a region; `Space` changes its desired block state; `a` applies it; `u` removes all blocks; `s` checks the saved firewall rules; `p` or `r` updates one/all HTTPS estimates; `c` switches repeated measurement (five seconds after the previous one finishes); `R` refreshes region data; `q` quits. Block selections persist on disk; periodic measurements do not. Dropshit checks its rules on startup (polkit authentication) and warns if saved rules are missing or the selection has not been applied. Check again with `s` after external firewall changes.
+`↑` / `↓` (or `j` / `k`) select a region; `Space` changes its desired block state; `a` applies it; `u` removes all blocks; `s` checks the saved firewall rules; `p` or `r` updates one/all HTTPS estimates; `c` switches repeated measurement (five seconds after the previous one finishes); `R` refreshes region data; `q` quits. Press `d` to show/hide the selected region's HTTPS address and game network; `n`/`b` cycle its CIDRs. The compact region table adapts to terminals as narrow as 48 columns and never prints long address lists across the screen. Block selections persist on disk; periodic measurements do not. Dropshit checks its rules on startup (polkit authentication) and warns if saved rules are missing or the selection has not been applied. Check again with `s` after external firewall changes.
 
 The regional metric is **HTTPS response time over reused TCP/TLS connections**, not Overwatch's in-game UDP ping. It fetches the current test URLs from `https://gcping.com/api/endpoints`, warms one connection and averages three subsequent HTTPS requests. HTTP error, unavailable address or non-reused connection results in an error, not a made-up game RTT. Standard curl proxy and system routing settings are respected. `ord1` uses an Iowa regional proxy; archival `icn1` has no current game network and cannot be blocked.
 

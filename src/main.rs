@@ -15,6 +15,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use unicode_width::UnicodeWidthChar;
 
 enum Message {
     Loaded(Result<Vec<Region>, String>),
@@ -30,6 +31,8 @@ struct App {
     running: HashSet<String>,
     last: HashMap<String, Instant>,
     flows: HashMap<String, usize>,
+    details: bool,
+    network_index: usize,
     continuous: bool,
     status: String,
     firewall_state: String,
@@ -51,6 +54,8 @@ impl App {
             running: HashSet::new(),
             last: HashMap::new(),
             flows: HashMap::new(),
+            details: false,
+            network_index: 0,
             continuous: false,
             status: "Загружаю регионы…".into(),
             firewall_state: "не проверено".into(),
@@ -142,6 +147,8 @@ impl App {
         match message {
             Message::Loaded(Ok(regions)) => {
                 self.regions = regions;
+                self.selected = self.selected.min(self.regions.len().saturating_sub(1));
+                self.network_index = 0;
                 self.status = format!(
                     "{} регионов • HTTPS-узлы не являются серверами игры",
                     self.regions.len()
@@ -201,7 +208,8 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self) -> bool {
+        let mut changed = false;
         if self.continuous {
             let now = Instant::now();
             let due: Vec<_> = self
@@ -217,115 +225,216 @@ impl App {
                 .map(|r| r.code.clone())
                 .collect();
             for code in due {
-                self.probe(&code)
+                self.probe(&code);
+                changed = true;
             }
         }
+        changed
     }
 
-    fn render(&self, out: &mut impl Write) -> io::Result<()> {
-        let (width, height) = terminal::size().unwrap_or((100, 30));
-        execute!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
-        writeln!(
-            out,
-            "Dropshit 0.1.0 — региональная HTTPS-задержка (НЕ пинг Overwatch)"
-        )?;
-        writeln!(out, "Статус: {}", self.status)?;
-        writeln!(out, "Правила: {}", self.firewall_state)?;
-        writeln!(
-            out,
-            "↑↓ выбор  Пробел блок/разблок  a применить  u снять все  s проверить правила  p/r HTTPS  c постоянно [{}]  R список  q выход",
-            if self.continuous { "да" } else { "нет" }
-        )?;
-        writeln!(
-            out,
-            "{:<4} {:<6} {:<26} {:<35} {:<12} {}",
-            "", "код", "регион", "HTTPS-адрес :443", "задержка", "UDP потоки"
-        )?;
-        if width < 86 || height < 17 {
-            writeln!(
-                out,
-                "Увеличьте окно терминала до 86×17 (сейчас {width}×{height})"
-            )?;
-            return out.flush();
+    fn lines(&self, width: usize, height: usize) -> Vec<String> {
+        let mut screen = Vec::new();
+        if width < 48 || height < 15 {
+            screen.push(fit("Dropshit — нужно окно от 48×15", width));
+            screen.push(fit(&format!("Сейчас: {width}×{height}  •  q выход"), width));
+            return screen;
         }
-        let visible = (height as usize).saturating_sub(13).max(1);
+
+        screen.push(fit(
+            &format!(
+                "DROPSHIT {}  •  HTTPS-задержка региона ≠ пинг игры",
+                env!("CARGO_PKG_VERSION")
+            ),
+            width,
+        ));
+        screen.push(fit(&format!("Список: {}", self.status), width));
+        screen.push(fit(&format!("Правила: {}", self.firewall_state), width));
+        screen.push(fit(
+            &format!(
+                "Выбор: {}  •  HTTPS-автозамер: {}",
+                if self.dirty {
+                    "НЕ ПРИМЕНЁН"
+                } else {
+                    "без изменений"
+                },
+                if self.continuous {
+                    "вкл"
+                } else {
+                    "выкл"
+                }
+            ),
+            width,
+        ));
+        screen.push(fit(&"─".repeat(width.saturating_sub(1)), width));
+
+        let wide = width >= 72;
+        if wide {
+            let region_width = width.saturating_sub(32);
+            screen.push(fit(
+                &format!(
+                    "     {:<6} {} {:>10} {:>5}",
+                    "КОД",
+                    padded("РЕГИОН", region_width),
+                    "HTTPS",
+                    "UDP"
+                ),
+                width,
+            ));
+        } else {
+            let region_width = width.saturating_sub(25);
+            screen.push(fit(
+                &format!(
+                    "     {:<6} {} {:>10}",
+                    "КОД",
+                    padded("РЕГИОН", region_width),
+                    "HTTPS"
+                ),
+                width,
+            ));
+        }
+
+        let footer = 6;
+        let visible = height.saturating_sub(screen.len() + footer).max(1);
         let first = self
             .selected
             .saturating_sub(visible / 2)
             .min(self.regions.len().saturating_sub(visible));
         for (idx, region) in self.regions.iter().enumerate().skip(first).take(visible) {
-            let indicator = if region.legacy {
+            let mark = if region.legacy {
                 "арх"
             } else if self.blocked.contains(&region.code) {
                 "[x]"
             } else {
                 "[ ]"
             };
-            let ping = if let Some(Ok(time)) = self.times.get(&region.code) {
-                format!(
-                    "{:.0} мс{}",
-                    time.as_secs_f64() * 1000.,
+            let latency = match self.times.get(&region.code) {
+                Some(Ok(ms)) => format!(
+                    "{:.0}мс{}",
+                    ms.as_secs_f64() * 1000.,
                     if self.running.contains(&region.code) {
-                        " ↻"
+                        "*"
                     } else {
                         ""
                     }
-                )
-            } else if let Some(Err(_)) = self.times.get(&region.code) {
-                "нет ответа".into()
-            } else {
-                "ожидание…".into()
+                ),
+                Some(Err(_)) => "ошибка".into(),
+                None => "замер…".into(),
             };
-            let host = region
-                .url
-                .trim_start_matches("https://")
-                .trim_end_matches('/');
-            writeln!(
-                out,
-                "{}{} {:<6} {:<26} {:<35} {:<12} {}",
+            let region_width = if wide {
+                width.saturating_sub(32)
+            } else {
+                width.saturating_sub(25)
+            };
+            let prefix = format!(
+                "{}{} {:<6} ",
                 if idx == self.selected { ">" } else { " " },
-                indicator,
-                region.code,
-                region.title,
-                host,
-                ping,
-                self.flows.get(&region.code).copied().unwrap_or(0)
-            )?;
+                mark,
+                region.code
+            );
+            let row = if wide {
+                format!(
+                    "{prefix}{} {:>10} {:>5}",
+                    padded(&region.title, region_width),
+                    latency,
+                    self.flows.get(&region.code).copied().unwrap_or(0)
+                )
+            } else {
+                format!(
+                    "{prefix}{} {:>10}",
+                    padded(&region.title, region_width),
+                    latency
+                )
+            };
+            screen.push(fit(&row, width));
         }
+
+        screen.push(fit(&"─".repeat(width.saturating_sub(1)), width));
         if let Some(region) = self.regions.get(self.selected) {
-            writeln!(
-                out,
-                "\nРегион {}: тестовый HTTPS {}",
-                region.code, region.url
-            )?;
-            writeln!(
-                out,
-                "Сети игры (UDP 12000–64000): {}",
-                region
+            if self.details {
+                let net = region
                     .networks
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )?;
-            if region.code == "ord1" {
-                writeln!(
-                    out,
-                    "Iowa — географический суррогат; не точный игровой дата-центр"
-                )?
+                    .get(self.network_index % region.networks.len().max(1));
+                screen.push(fit(
+                    &format!(
+                        "{} • {} игровых CIDR • UDP 12000–64000",
+                        region.code,
+                        region.networks.len()
+                    ),
+                    width,
+                ));
+                let host = region.url.strip_prefix("https://").unwrap_or(&region.url);
+                screen.push(fit(&format!("HTTPS: {host}"), width));
+                let note = if let Some(net) = net {
+                    format!(
+                        "CIDR {}/{}: {net}  •  n/b",
+                        (self.network_index % region.networks.len()) + 1,
+                        region.networks.len()
+                    )
+                } else {
+                    "Архив: игровые сети отсутствуют".into()
+                };
+                screen.push(fit(&note, width));
+            } else {
+                screen.push(fit(
+                    &format!(
+                        "{} • {} сетей игры • d — адрес и детали",
+                        region.code,
+                        region.networks.len()
+                    ),
+                    width,
+                ));
             }
-            if region.legacy {
-                writeln!(
-                    out,
-                    "Архивная локация: в актуальном списке игровых сетей отсутствует"
-                )?
-            }
-            if let Some(Err(e)) = self.times.get(&region.code) {
-                writeln!(out, "HTTPS-ошибка: {e}")?
-            }
+        } else {
+            screen.push(fit("Ожидание данных о регионах…", width));
+        }
+        screen.push(fit("↑↓  Space блок  a применить  u снять  q выход", width));
+        screen.push(fit(
+            "p/r HTTPS  c авто  s правила  R список  d детали",
+            width,
+        ));
+        screen.truncate(height);
+        screen
+    }
+
+    fn render(&self, out: &mut impl Write) -> io::Result<()> {
+        let (width, height) = terminal::size().unwrap_or((80, 24));
+        let lines = self.lines(width as usize, height as usize);
+        execute!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+        for (y, line) in lines.iter().enumerate() {
+            execute!(out, cursor::MoveTo(0, y as u16))?;
+            write!(out, "{line}")?;
         }
         out.flush()
     }
+}
+
+fn fit(text: &str, width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let size = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + size >= width {
+            break;
+        }
+        result.push(ch);
+        used += size;
+    }
+    result
+}
+
+fn padded(text: &str, width: usize) -> String {
+    let mut result = fit(text, width + 1);
+    let mut used = result
+        .chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum::<usize>();
+    while used > width {
+        if let Some(last) = result.pop() {
+            used -= UnicodeWidthChar::width(last).unwrap_or(0);
+        }
+    }
+    result.push_str(&" ".repeat(width.saturating_sub(used)));
+    result
 }
 
 struct Terminal;
@@ -343,10 +452,60 @@ impl Drop for Terminal {
     }
 }
 
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn no_line_wraps_or_overruns_small_terminal() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.regions = (0..12)
+            .map(|i| Region {
+                code: format!("test{i}"),
+                title: "Очень длинное название региона 大阪".into(),
+                url: "https://very-long-regional-host.example.org/".into(),
+                networks: (0..65)
+                    .map(|n| format!("192.0.{n}.0/24").parse().unwrap())
+                    .collect(),
+                legacy: false,
+            })
+            .collect();
+        app.selected = 11;
+        app.details = true;
+        app.network_index = 64;
+        app.firewall_state =
+            "ВНИМАНИЕ: очень длинное уведомление с повторяющимся текстом".repeat(5);
+        for (width, height) in [(40, 10), (48, 15), (60, 18), (80, 24), (120, 30)] {
+            let lines = app.lines(width, height);
+            assert!(lines.len() <= height);
+            for line in &lines {
+                assert!(
+                    line.chars()
+                        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                        .sum::<usize>()
+                        < width,
+                    "{width}×{height}: {line:?}"
+                );
+            }
+            if width >= 48 && height >= 15 {
+                assert!(lines.iter().any(|line| line.contains("test11")));
+                assert!(lines.iter().any(|line| line.contains("q выход")));
+                assert!(lines.iter().any(|line| line.contains("CIDR 65/65")));
+                let row = lines.iter().find(|line| line.contains("test11")).unwrap();
+                assert!(
+                    row.contains("замер"),
+                    "HTTPS column should remain visible: {row}"
+                );
+            }
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--help") {
         println!(
-            "Dropshit TUI: стрелки — регион, пробел — блокировка, a — применить, u — снять, s — проверить правила, p/r — HTTPS-замер, c — постоянный замер, R — обновить список, q — выход. Требуются curl, iproute2 и терминал."
+            "Dropshit TUI: стрелки — регион, пробел — блокировка, a — применить, u — снять, s — проверить правила, p/r — HTTPS-замер, c — постоянный замер, d — детали, n/b — игровые сети, R — обновить список, q — выход. Требуются curl, iproute2 и терминал."
         );
         return Ok(());
     }
@@ -355,25 +514,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(tx);
     app.fetch();
     let mut last_flow_check = Instant::now() - Duration::from_secs(10);
+    let mut redraw = true;
     loop {
         while let Ok(msg) = rx.try_recv() {
-            app.event(msg)
+            app.event(msg);
+            redraw = true;
         }
-        app.tick();
+        redraw |= app.tick();
         if last_flow_check.elapsed() >= Duration::from_secs(3) {
-            app.flows = data::observe_udp(&app.regions);
+            let flows = data::observe_udp(&app.regions);
+            if flows != app.flows {
+                app.flows = flows;
+                redraw = true;
+            }
             last_flow_check = Instant::now();
         }
-        app.render(&mut io::stdout())?;
+        if redraw {
+            app.render(&mut io::stdout())?;
+            redraw = false;
+        }
         if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
+            let input = event::read()?;
+            if matches!(input, Event::Resize(_, _)) {
+                redraw = true;
+            }
+            if let Event::Key(key) = input {
+                redraw = true;
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Down | KeyCode::Char('j') => {
-                        app.selected = (app.selected + 1).min(app.regions.len().saturating_sub(1))
+                        app.selected = (app.selected + 1).min(app.regions.len().saturating_sub(1));
+                        app.network_index = 0;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        app.selected = app.selected.saturating_sub(1)
+                        app.selected = app.selected.saturating_sub(1);
+                        app.network_index = 0;
                     }
                     KeyCode::Char(' ') => {
                         if let Some(r) = app.regions.get(app.selected) {
@@ -397,6 +572,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     KeyCode::Char('r') => app.probe_all(),
+                    KeyCode::Char('d') => app.details = !app.details,
+                    KeyCode::Char('n') => app.network_index = app.network_index.wrapping_add(1),
+                    KeyCode::Char('b') => app.network_index = app.network_index.wrapping_sub(1),
                     KeyCode::Char('s') => app.check_firewall(),
                     KeyCode::Char('c') => app.continuous = !app.continuous,
                     KeyCode::Char('R') => app.fetch(),
