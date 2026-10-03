@@ -331,32 +331,138 @@ fn save(uid: u32, backend: &str, nets: &[IpNet]) -> Result<(), String> {
     Ok(())
 }
 
+fn ip_number(ip: std::net::IpAddr) -> u128 {
+    match ip {
+        std::net::IpAddr::V4(ip) => u32::from(ip) as u128,
+        std::net::IpAddr::V6(ip) => u128::from(ip),
+    }
+}
+
+fn net_interval(net: &IpNet) -> (u128, u128) {
+    (ip_number(net.network()), ip_number(net.broadcast()))
+}
+
+fn merge_intervals(mut ranges: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+    ranges.sort();
+    let mut merged: Vec<(u128, u128)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1.saturating_add(1)
+        {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn nft_element_interval(value: &Value, v4: bool) -> Option<(u128, u128)> {
+    let address = |value: &Value| -> Option<std::net::IpAddr> {
+        let ip: std::net::IpAddr = value.as_str()?.parse().ok()?;
+        (ip.is_ipv4() == v4).then_some(ip)
+    };
+    if let Some(prefix) = value.get("prefix") {
+        let ip = address(&prefix["addr"])?;
+        let len = u8::try_from(prefix["len"].as_u64()?).ok()?;
+        return Some(net_interval(&IpNet::new(ip, len).ok()?));
+    }
+    if let Some(range) = value.get("range").and_then(Value::as_array) {
+        if range.len() != 2 {
+            return None;
+        }
+        let start = ip_number(address(&range[0])?);
+        let end = ip_number(address(&range[1])?);
+        return (start <= end).then_some((start, end));
+    }
+    let ip = ip_number(address(value)?);
+    Some((ip, ip))
+}
+
+fn nft_installed_json(uid: u32, nets: &[IpNet], document: &Value) -> bool {
+    let Some(objects) = document["nftables"].as_array() else {
+        return false;
+    };
+    let table = format!("dropshit_{uid}");
+    let owned = |obj: &Value| obj["family"] == "inet" && obj["table"] == table;
+    if !objects.iter().any(|obj| {
+        let chain = &obj["chain"];
+        owned(chain)
+            && chain["name"] == "output"
+            && chain["type"] == "filter"
+            && chain["hook"] == "output"
+            && chain["prio"] == -10
+            && chain["policy"] == "accept"
+    }) {
+        return false;
+    }
+    for (v4, name, kind, protocol) in [
+        (true, "blocked4", "ipv4_addr", "ip"),
+        (false, "blocked6", "ipv6_addr", "ip6"),
+    ] {
+        let wanted = merge_intervals(
+            nets.iter()
+                .filter(|n| n.addr().is_ipv4() == v4)
+                .map(net_interval)
+                .collect(),
+        );
+        if wanted.is_empty() {
+            continue;
+        }
+        let Some(set) = objects
+            .iter()
+            .map(|obj| &obj["set"])
+            .find(|s| owned(s) && s["name"] == name && s["type"] == kind)
+        else {
+            return false;
+        };
+        let Some(elements) = set["elem"].as_array() else {
+            return false;
+        };
+        let Some(actual) = elements
+            .iter()
+            .map(|e| nft_element_interval(e, v4))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        if merge_intervals(actual) != wanted {
+            return false;
+        }
+        let expected = json!([
+            {"match":{"op":"==","left":{"meta":{"key":"skuid"}},"right":uid}},
+            {"match":{"op":"==","left":{"payload":{"protocol":protocol,"field":"daddr"}},"right":format!("@{name}")}},
+            {"match":{"op":"==","left":{"payload":{"protocol":"udp","field":"dport"}},"right":{"range":[12000,64000]}}}
+        ]);
+        if !objects.iter().any(|obj| {
+            let rule = &obj["rule"];
+            owned(rule)
+                && rule["chain"] == "output"
+                && rule["expr"].as_array().is_some_and(|expr| {
+                    expr.len() == 4
+                        && expr[..3] == expected.as_array().unwrap()[..]
+                        && expr[3].get("reject").is_some()
+                })
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
 fn installed(uid: u32, backend: &str, nets: &[IpNet]) -> Result<bool, String> {
     if nets.is_empty() {
         return Ok(true);
     }
     if backend == "nftables" {
         let table = format!("dropshit_{uid}");
-        let text = match command(NFT, &["list", "table", "inet", &table], None) {
+        let text = match command(NFT, &["-j", "list", "table", "inet", &table], None) {
             Ok(text) => text,
             Err(_) => return Ok(false),
         };
-        // Check the owned table and its hook. Single-address sets omit /32 and /128.
-        Ok(text.contains("hook output")
-            && text.contains(&format!("skuid {uid}"))
-            && text.contains("12000-64000")
-            && nets.iter().all(|n| {
-                text.contains(&n.to_string())
-                    || match n {
-                        IpNet::V4(ip) if ip.prefix_len() == 32 => {
-                            text.contains(&ip.addr().to_string())
-                        }
-                        IpNet::V6(ip) if ip.prefix_len() == 128 => {
-                            text.contains(&ip.addr().to_string())
-                        }
-                        _ => false,
-                    }
-            }))
+        let document: Value =
+            serde_json::from_str(&text).map_err(|e| format!("invalid nft JSON: {e}"))?;
+        Ok(nft_installed_json(uid, nets, &document))
     } else {
         for family in [4, 6] {
             let selected: Vec<_> = nets
@@ -527,6 +633,29 @@ pub fn helper() -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn interval_comparison_preserves_holes_and_full_ipv6_range() {
+        assert_eq!(
+            merge_intervals(vec![(10, 20), (21, 30), (12, 15)]),
+            vec![(10, 30)]
+        );
+        assert_eq!(
+            merge_intervals(vec![(10, 20), (22, 30)]),
+            vec![(10, 20), (22, 30)]
+        );
+        assert_eq!(
+            merge_intervals(vec![(0, u128::MAX), (u128::MAX, u128::MAX)]),
+            vec![(0, u128::MAX)]
+        );
+        assert_eq!(
+            nft_element_interval(&json!({"range":["34.84.0.0","34.87.191.255"]}), true),
+            Some((
+                ip_number("34.84.0.0".parse().unwrap()),
+                ip_number("34.87.191.255".parse().unwrap())
+            ))
+        );
+        assert!(nft_element_interval(&json!({"range":["::1","::2"]}), true).is_none());
+    }
+    #[test]
     fn limits_networks_and_never_wipes_foreign_tables() {
         assert!(parse_networks(&json!(["0.0.0.0/0"])).is_err());
         let nets = parse_networks(&json!(["34.88.201.2/24", "::1/128"])).unwrap();
@@ -543,9 +672,62 @@ mod tests {
             return;
         }
         let uid = 1000;
-        let networks = parse_networks(&json!(["127.0.0.1/32", "::1/128"])).unwrap();
+        let networks = parse_networks(&json!([
+            "127.0.0.1/32",
+            "::1/128",
+            "5.42.160.0/22",
+            "5.42.164.0/22",
+            "5.42.168.0/21",
+            "34.84.0.0/16",
+            "34.85.0.0/16",
+            "34.86.0.0/16",
+            "34.87.0.0/17",
+            "34.87.128.0/18",
+            "2600:1900:4080::/44",
+            "2600:1900:4090::/44"
+        ]))
+        .unwrap();
         command(NFT, &["add", "table", "inet", "foreign_table"], None).unwrap();
         nft_apply(uid, &networks).unwrap();
+        let text = command(
+            NFT,
+            &["-j", "list", "table", "inet", &format!("dropshit_{uid}")],
+            None,
+        )
+        .unwrap();
+        let document: Value = serde_json::from_str(&text).unwrap();
+        assert!(nft_installed_json(uid, &networks, &document));
+        for fault in [
+            "missing-set",
+            "wrong-uid",
+            "missing-hook",
+            "accept-instead-of-reject",
+            "missing-address",
+        ] {
+            let mut broken = document.clone();
+            for obj in broken["nftables"].as_array_mut().unwrap() {
+                if obj.get("set").is_some() && obj["set"]["name"] == "blocked4" {
+                    if fault == "missing-set" {
+                        obj["set"]["name"] = "other".into();
+                    }
+                    if fault == "missing-address" {
+                        obj["set"]["elem"].as_array_mut().unwrap().pop();
+                    }
+                }
+                if obj.get("chain").is_some() && fault == "missing-hook" {
+                    obj["chain"]["hook"] = "input".into();
+                }
+                if obj.get("rule").is_some() {
+                    if fault == "wrong-uid" {
+                        obj["rule"]["expr"][0]["match"]["right"] = 1001.into();
+                    }
+                    if fault == "accept-instead-of-reject" {
+                        obj["rule"]["expr"][3] = json!({"accept":null});
+                    }
+                }
+            }
+            assert!(!nft_installed_json(uid, &networks, &broken), "{fault}");
+        }
         assert!(
             installed(uid, "nftables", &networks).unwrap(),
             "{}",

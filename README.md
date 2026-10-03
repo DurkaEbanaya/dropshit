@@ -6,10 +6,10 @@ Independent GPL-3.0 Rust terminal app for Linux: regional HTTPS latency estimate
 
 Download a package from [Releases](https://github.com/DurkaEbanaya/dropshit/releases):
 
-- Debian 12 / Ubuntu 24.04+: `sudo apt install ./dropshit_0.1.3-1_amd64.deb`
-- Fedora: `sudo dnf install ./dropshit-0.1.3-1.fc.x86_64.rpm`
-- openSUSE Tumbleweed: `sudo zypper --no-gpg-checks install ./dropshit-0.1.3-1.x86_64.rpm` (RPMs are unsigned)
-- Arch Linux: `sudo pacman -U ./dropshit-0.1.3-1-x86_64.pkg.tar.zst`
+- Debian 12 / Ubuntu 24.04+: `sudo apt install ./dropshit_0.1.4-1_amd64.deb`
+- Fedora: `sudo dnf install ./dropshit-0.1.4-1.fc.x86_64.rpm`
+- openSUSE Tumbleweed: `sudo zypper --no-gpg-checks install ./dropshit-0.1.4-1.x86_64.rpm` (RPMs are unsigned)
+- Arch Linux: `sudo pacman -U ./dropshit-0.1.4-1-x86_64.pkg.tar.zst`
 
 Run `dropshit` in a terminal **as your normal user**, never with sudo. A desktop polkit authentication agent is needed for the firewall helper (`pkexec`); on a console without an agent, the firewall commands cannot authenticate. Install `nftables >= 1.0.9` or `iptables` including IPv6 tools; the nftables backend is chosen by default. To force iptables, edit `/etc/dropshit/firewall.json` as root and set `{"backend":"iptables"}`. Keep the previous backend installed until the migration is applied.
 
