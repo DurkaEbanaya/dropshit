@@ -1,0 +1,19 @@
+pkgname=dropshit
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Rust terminal game region selector and HTTPS latency monitor'
+arch=('x86_64')
+url='https://github.com/DurkaEbanaya/dropshit'
+license=('GPL-3.0-only')
+depends=('glibc' 'curl' 'iproute2' 'polkit' 'nftables')
+optdepends=('iptables: alternative firewall backend')
+backup=('etc/dropshit/firewall.json')
+install=dropshit.install
+source=("dropshit-linux-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    sh "${srcdir}/dropshit-linux-${pkgver}/packaging/stage.sh" "${pkgdir}" \
+        "${srcdir}/dropshit-linux-${pkgver}/bin/dropshit" \
+        "${srcdir}/dropshit-linux-${pkgver}/bin/dropshit-helper"
+}

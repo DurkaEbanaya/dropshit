@@ -1,0 +1,11 @@
+[Unit]
+Description=Restore persistent Dropshit game region rules
+After=firewalld.service nftables.service iptables.service ip6tables.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/dropshit-helper --restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,98 @@
+name: Build and release Linux
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: debian:12
+    steps:
+      - run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y curl git ca-certificates gcc build-essential pkg-config python3 rpm dpkg-dev
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - run: |
+          bash packaging/package-rpm.sh
+          bash packaging/package-deb.sh
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+          rpm -qpR dist/*.x86_64.rpm
+          rpm -qpl dist/*.x86_64.rpm
+          sha256sum dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-rpm-source
+          path: dist/*
+          if-no-files-found: error
+
+  arch:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: archlinux:base-devel
+    steps:
+      - run: pacman -Sy --noconfirm --needed git python
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-rpm-source
+          path: dist
+      - run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- bash packaging/package-arch.sh
+          bsdtar -tf dist/*.pkg.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  fedora:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: fedora:latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-rpm-source
+          path: dist
+      - run: dnf install -y "$(pwd)/dist/dropshit-0.1.0-1.x86_64.rpm"
+
+  opensuse:
+    needs: build
+    runs-on: ubuntu-24.04
+    container: opensuse/tumbleweed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-rpm-source
+          path: dist
+      - run: zypper --non-interactive --no-gpg-checks install --dry-run "$(pwd)/dist/dropshit-0.1.0-1.x86_64.rpm"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, arch, fedora, opensuse]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+          path: dist
+      - run: |
+          test "$GITHUB_REF_NAME" = v0.1.0
+          (cd dist && sha256sum ./*.deb ./*.rpm ./*.pkg.tar.zst ./*.tar.gz > SHA256SUMS)
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.deb dist/*.rpm dist/*.pkg.tar.zst dist/*.tar.gz dist/SHA256SUMS --verify-tag --title "Dropshit $GITHUB_REF_NAME" --notes-file docs/release.md --latest
