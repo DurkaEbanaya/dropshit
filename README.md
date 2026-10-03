@@ -7,7 +7,7 @@ Independent GPL-3.0 Rust terminal app for Linux: regional HTTPS latency estimate
 Download a package from [Releases](https://github.com/DurkaEbanaya/dropshit/releases):
 
 - Debian 12 / Ubuntu 24.04+: `sudo apt install ./dropshit_0.1.0-1_amd64.deb`
-- Fedora: `sudo dnf install ./dropshit-0.1.0-1.x86_64.rpm`
+- Fedora: `sudo dnf install ./dropshit-0.1.0-1.fc.x86_64.rpm`
 - openSUSE Tumbleweed: `sudo zypper --no-gpg-checks install ./dropshit-0.1.0-1.x86_64.rpm` (RPMs are unsigned)
 - Arch Linux: `sudo pacman -U ./dropshit-0.1.0-1-x86_64.pkg.tar.zst`
 

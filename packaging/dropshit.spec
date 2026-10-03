@@ -8,7 +8,11 @@ Source0:        dropshit-linux-%{version}.tar.gz
 BuildArch:      x86_64
 %global debug_package %{nil}
 Requires:       curl
+%if 0%{?fedora}
+Requires:       iproute
+%else
 Requires:       iproute2
+%endif
 Requires:       polkit
 Requires:       (nftables >= 1.0.9 or iptables)
 

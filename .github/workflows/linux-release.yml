@@ -64,7 +64,7 @@ jobs:
         with:
           name: deb-rpm-source
           path: dist
-      - run: dnf install -y "$(pwd)/dist/dropshit-0.1.0-1.x86_64.rpm"
+      - run: dnf install -y "$(pwd)/dist/dropshit-0.1.0-1.fc.x86_64.rpm"
 
   opensuse:
     needs: build
