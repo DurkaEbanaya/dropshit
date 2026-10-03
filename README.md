@@ -6,10 +6,10 @@ Independent GPL-3.0 Rust terminal app for Linux: regional HTTPS latency estimate
 
 Download a package from [Releases](https://github.com/DurkaEbanaya/dropshit/releases):
 
-- Debian 12 / Ubuntu 24.04+: `sudo apt install ./dropshit_0.1.1-1_amd64.deb`
-- Fedora: `sudo dnf install ./dropshit-0.1.1-1.fc.x86_64.rpm`
-- openSUSE Tumbleweed: `sudo zypper --no-gpg-checks install ./dropshit-0.1.1-1.x86_64.rpm` (RPMs are unsigned)
-- Arch Linux: `sudo pacman -U ./dropshit-0.1.1-1-x86_64.pkg.tar.zst`
+- Debian 12 / Ubuntu 24.04+: `sudo apt install ./dropshit_0.1.2-1_amd64.deb`
+- Fedora: `sudo dnf install ./dropshit-0.1.2-1.fc.x86_64.rpm`
+- openSUSE Tumbleweed: `sudo zypper --no-gpg-checks install ./dropshit-0.1.2-1.x86_64.rpm` (RPMs are unsigned)
+- Arch Linux: `sudo pacman -U ./dropshit-0.1.2-1-x86_64.pkg.tar.zst`
 
 Run `dropshit` in a terminal **as your normal user**, never with sudo. A desktop polkit authentication agent is needed for the firewall helper (`pkexec`); on a console without an agent, the firewall commands cannot authenticate. Install `nftables >= 1.0.9` or `iptables` including IPv6 tools; the nftables backend is chosen by default. To force iptables, edit `/etc/dropshit/firewall.json` as root and set `{"backend":"iptables"}`. Keep the previous backend installed until the migration is applied.
 
@@ -20,6 +20,12 @@ Run `dropshit` in a terminal **as your normal user**, never with sudo. A desktop
 The regional metric is **HTTPS response time over reused TCP/TLS connections**, not Overwatch's in-game UDP ping. It fetches the current test URLs from `https://gcping.com/api/endpoints`, warms one connection and averages three subsequent HTTPS requests. HTTP error, unavailable address or non-reused connection results in an error, not a made-up game RTT. Standard curl proxy and system routing settings are respected. `ord1` uses an Iowa regional proxy; archival `icn1` has no current game network and cannot be blocked.
 
 Game CIDRs come from `https://stowmyy.github.io/dropship/ips.json` (`servers.overwatch[].block`). Neither its ICMP probe IPs nor the HTTPS test endpoints are used as game-server firewall destinations. Rules filter **only the invoking user's UDP destinations within the selected game CIDRs and destination ports 12000–64000**. An unrelated program using these same IPs and ports under this user can also be affected. `ss` can show current Overwatch-owned UDP destinations in the region; observations are session-only and are not treated as latency measurements. Firewall rules persist when the TUI closes; they are restored at boot by `dropshit-restore.service`. On removal, the package clears its own saved rules and disables the restore service.
+
+Exact [address supplements](docs/address-supplements.md) also include user-observed
+`66.40.191.240/32` (Amsterdam, Netherlands) and `85.236.97.71/32` (Boston, US east).
+The latter belongs to Unity and may carry voice traffic; its geographic grouping
+does not establish a matchmaker datacenter code. After upgrading, press `a` when
+the TUI warns that saved regional rules do not cover the updated list.
 
 ## Build and verify
 

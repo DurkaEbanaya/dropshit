@@ -6,6 +6,11 @@ use serde_json::Value;
 pub const IPS_URL: &str = "https://stowmyy.github.io/dropship/ips.json";
 pub const ENDPOINTS_URL: &str = "https://gcping.com/api/endpoints";
 
+// Exact user-observed peers missing from the external feed. Geographic grouping,
+// not confirmation of an Overwatch datacenter code; see docs/address-supplements.md.
+const ADDRESS_SUPPLEMENTS: &[(&str, &str)] =
+    &[("ams1", "66.40.191.240/32"), ("gue4", "85.236.97.71/32")];
+
 pub const REGIONS: &[(&str, &str, &str)] = &[
     ("ams1", "Нидерланды", "europe-west4"),
     ("gbr1", "Бразилия — Сан-Паулу", "southamerica-east1"),
@@ -75,9 +80,21 @@ pub fn parse_regions(ips: &Value, endpoints: &Value) -> Result<Vec<Region>, Stri
     }
     let mut regions = Vec::new();
     for &(code, title, key) in REGIONS {
-        let networks = by_code
+        let mut networks = by_code
             .remove(code)
             .ok_or_else(|| format!("missing region {code}"))?;
+        for &(region, cidr) in ADDRESS_SUPPLEMENTS {
+            if region == code {
+                let net: IpNet = cidr.parse().map_err(|e| format!("{code}: {e}"))?;
+                // If the feed later includes this peer, do not add an overlapping /32.
+                if !networks
+                    .iter()
+                    .any(|existing| existing.contains(&net.addr()))
+                {
+                    networks.push(net);
+                }
+            }
+        }
         let url = endpoints
             .get(key)
             .and_then(|e| e.get("URL"))
@@ -233,6 +250,78 @@ pub fn observe_udp(regions: &[Region]) -> HashMap<String, usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixtures() -> (Value, Value) {
+        let rows: Vec<_> = REGIONS.iter().enumerate().map(|(i, (code, _, _))| {
+            serde_json::json!({"token":code,"block":format!("192.0.2.{}/32", i + 1)})
+        }).collect();
+        let mut endpoints = serde_json::Map::new();
+        for key in REGIONS
+            .iter()
+            .map(|(_, _, key)| *key)
+            .chain(["asia-northeast3"])
+        {
+            endpoints.insert(
+                key.into(),
+                serde_json::json!({"URL":"https://test.a.run.app"}),
+            );
+        }
+        (
+            serde_json::json!({"servers":{"overwatch":rows}}),
+            Value::Object(endpoints),
+        )
+    }
+
+    #[test]
+    fn observed_peers_are_blockable_in_only_their_geographic_region() {
+        let (ips, endpoints) = fixtures();
+        let regions = parse_regions(&ips, &endpoints).unwrap();
+        for (host, code) in [("66.40.191.240", "ams1"), ("85.236.97.71", "gue4")] {
+            let ip: IpAddr = host.parse().unwrap();
+            let matches: Vec<_> = regions
+                .iter()
+                .filter(|r| r.networks.iter().any(|n| n.contains(&ip)))
+                .collect();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].code, code);
+            assert!(
+                matches[0]
+                    .networks
+                    .iter()
+                    .any(|n| n.addr() == ip && n.prefix_len() == 32)
+            );
+        }
+        for host in [
+            "66.40.191.239",
+            "66.40.191.241",
+            "85.236.97.70",
+            "85.236.97.72",
+        ] {
+            let ip: IpAddr = host.parse().unwrap();
+            assert!(
+                regions
+                    .iter()
+                    .all(|r| r.networks.iter().all(|n| !n.contains(&ip)))
+            );
+        }
+        let flows = "ESTAB 0 0 192.168.1.3:42000 66.40.191.240:26542 users:((\"Overwatch.exe\",pid=1,fd=2))\n\
+ESTAB 0 0 192.168.1.3:42001 85.236.97.71:43422 users:((\"Overwatch.exe\",pid=1,fd=3))\n";
+        let counts = parse_overwatch_flows(flows, &regions);
+        assert_eq!(counts["ams1"], 1);
+        assert_eq!(counts["gue4"], 1);
+        assert!(!counts.contains_key("gen1"));
+    }
+
+    #[test]
+    fn feed_coverage_supersedes_exact_supplements() {
+        let (mut ips, endpoints) = fixtures();
+        ips["servers"]["overwatch"][0]["block"] = "66.40.191.0/24".into();
+        let regions = parse_regions(&ips, &endpoints).unwrap();
+        assert_eq!(
+            regions[0].networks,
+            vec!["66.40.191.0/24".parse::<IpNet>().unwrap()]
+        );
+    }
     #[test]
     fn rejects_missing_region_without_inventing_game_addresses() {
         let endpoints = serde_json::json!({});

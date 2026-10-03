@@ -64,7 +64,7 @@ jobs:
         with:
           name: deb-rpm-source
           path: dist
-      - run: dnf install -y "$(pwd)/dist/dropshit-0.1.1-1.fc.x86_64.rpm"
+      - run: dnf install -y "$(pwd)"/dist/dropshit-*.fc.x86_64.rpm
 
   opensuse:
     needs: build
@@ -80,7 +80,11 @@ jobs:
           for repo in /etc/zypp/repos.d/*.repo; do
             sed -i 's|http://download.opensuse.org/|https://download.opensuse.org/|g' "$repo"
           done
-      - run: zypper --non-interactive --no-gpg-checks install --dry-run "$(pwd)/dist/dropshit-0.1.1-1.x86_64.rpm"
+      - run: |
+          for package in dist/*.x86_64.rpm; do
+            case "$package" in *.fc.x86_64.rpm) continue ;; esac
+            zypper --non-interactive --no-gpg-checks install --dry-run "$(pwd)/$package"
+          done
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -96,7 +100,8 @@ jobs:
           merge-multiple: true
           path: dist
       - run: |
-          test "$GITHUB_REF_NAME" = v0.1.1
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          test "$GITHUB_REF_NAME" = "v$version"
           (cd dist && sha256sum ./*.deb ./*.rpm ./*.pkg.tar.zst ./*.tar.gz > SHA256SUMS)
       - env:
           GH_TOKEN: ${{ github.token }}

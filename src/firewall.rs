@@ -569,12 +569,58 @@ mod tests {
     }
 
     #[test]
+    fn nft_supplemented_peers_are_blocked_without_blocking_neighbors() {
+        if std::env::var_os("DROPSHIT_KERNEL_PACKET_TEST").is_none() {
+            return;
+        }
+        let uid = unsafe { libc::getuid() };
+        command("/usr/sbin/ip", &["link", "set", "lo", "up"], None).unwrap();
+        for host in [
+            "66.40.191.240",
+            "66.40.191.241",
+            "85.236.97.71",
+            "85.236.97.72",
+        ] {
+            command(
+                "/usr/sbin/ip",
+                &["addr", "add", &format!("{host}/32"), "dev", "lo"],
+                None,
+            )
+            .unwrap();
+        }
+        let nets = parse_networks(&json!(["66.40.191.240/32", "85.236.97.71/32"])).unwrap();
+        nft_apply(uid, &nets).unwrap();
+        assert!(installed(uid, "nftables", &nets).unwrap());
+        for (host, blocked) in [
+            ("66.40.191.240", true),
+            ("66.40.191.241", false),
+            ("85.236.97.71", true),
+            ("85.236.97.72", false),
+        ] {
+            for port in [11999, 26542, 43422, 64001] {
+                let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+                assert_eq!(
+                    socket.send_to(&[1], format!("{host}:{port}")).is_err(),
+                    blocked && (12000..=64000).contains(&port)
+                );
+            }
+        }
+        nft_apply(uid, &[]).unwrap();
+    }
+
+    #[test]
     fn iptables_kernel_rule_lifecycle_in_isolated_user_and_network_namespace() {
         if std::env::var_os("DROPSHIT_KERNEL_IPTABLES").is_none() {
             return;
         }
         let uid = 1000;
-        let networks = parse_networks(&json!(["127.0.0.1/32", "::1/128"])).unwrap();
+        let networks = parse_networks(&json!([
+            "127.0.0.1/32",
+            "::1/128",
+            "66.40.191.240/32",
+            "85.236.97.71/32"
+        ]))
+        .unwrap();
         command(tool(4, false), &["-w", "-N", "FOREIGN_DROPSHIT_TEST"], None).unwrap();
         iptables_apply(uid, &networks).unwrap();
         assert!(installed(uid, "iptables", &networks).unwrap());

@@ -178,6 +178,20 @@ impl App {
                         .filter(|r| r.networks.iter().any(|n| reply.networks.contains(n)))
                         .map(|r| r.code.clone())
                         .collect();
+                    let needs_update = self
+                        .regions
+                        .iter()
+                        .filter(|r| self.blocked.contains(&r.code))
+                        .flat_map(|r| &r.networks)
+                        .any(|n| {
+                            !reply.networks.iter().any(|saved| {
+                                saved.prefix_len() <= n.prefix_len() && saved.contains(&n.addr())
+                            })
+                        });
+                    if needs_update {
+                        self.dirty = true;
+                        self.revision += 1;
+                    }
                 }
                 self.firewall_state =
                     if reply.backend != reply.selected_backend && !reply.networks.is_empty() {
@@ -455,6 +469,42 @@ impl Drop for Terminal {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn saved_region_missing_new_peer_requires_reapply() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.regions = vec![Region {
+            code: "ams1".into(),
+            title: "Netherlands".into(),
+            url: String::new(),
+            networks: vec![
+                "64.224.26.0/23".parse().unwrap(),
+                "66.40.191.240/32".parse().unwrap(),
+            ],
+            legacy: false,
+        }];
+        let reply = |networks: Vec<_>| client::Reply {
+            backend: "nftables".into(),
+            selected_backend: "nftables".into(),
+            networks,
+            active: true,
+        };
+        app.event(Message::Firewall(
+            false,
+            Ok(reply(vec!["64.224.26.0/23".parse().unwrap()])),
+        ));
+        assert!(app.blocked.contains("ams1"));
+        assert!(app.dirty);
+        assert!(app.firewall_state.contains("НЕ применён"));
+        app.applied_revision = app.revision;
+        app.event(Message::Firewall(
+            true,
+            Ok(reply(app.regions[0].networks.clone())),
+        ));
+        assert!(!app.dirty);
+        assert!(app.firewall_state.contains("активно"));
+    }
 
     #[test]
     fn no_line_wraps_or_overruns_small_terminal() {
