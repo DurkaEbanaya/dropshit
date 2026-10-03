@@ -6,3 +6,5 @@ fn main() {
         std::process::exit(1);
     }
 }
+#[path = "../networks.rs"]
+mod networks;

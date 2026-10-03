@@ -275,6 +275,8 @@ fn iptables_apply(uid: u32, nets: &[IpNet]) -> Result<(), String> {
 }
 
 fn apply(uid: u32, backend: &str, networks: &[IpNet]) -> Result<(), String> {
+    let protected = crate::networks::game_networks(networks);
+    let networks = protected.as_slice();
     match backend {
         "nftables" => nft_apply(uid, networks),
         "iptables" => iptables_apply(uid, networks),
@@ -442,7 +444,11 @@ pub fn helper() -> Result<(), String> {
             };
             let _held = lock(uid)?;
             if let Some((old_backend, nets)) = read_state(uid)? {
-                apply(uid, &old_backend, &nets)?;
+                let cleaned = crate::networks::game_networks(&nets);
+                apply(uid, &old_backend, &cleaned)?;
+                if cleaned != nets {
+                    save(uid, &old_backend, &cleaned)?;
+                }
             }
         }
         return Ok(());
@@ -461,10 +467,30 @@ pub fn helper() -> Result<(), String> {
         return Err("request too large".into());
     }
     let req: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let (previous_backend, previous) = match read_state(uid)? {
+    let valid = match req["action"].as_str() {
+        Some("status") => req.as_object().is_some_and(|obj| obj.len() == 1),
+        Some("apply") => req
+            .as_object()
+            .is_some_and(|obj| obj.len() == 2 && obj.contains_key("networks")),
+        _ => false,
+    };
+    if !valid {
+        return Err("invalid action or request fields".into());
+    }
+    if req["action"] == "apply" {
+        parse_networks(&req["networks"])?;
+    }
+    let (previous_backend, mut previous) = match read_state(uid)? {
         Some(saved) => saved,
         None => (backend()?.into(), vec![]),
     };
+    // Migrate saved voice blocks on the first authenticated check as well as boot.
+    let cleaned = crate::networks::game_networks(&previous);
+    if cleaned != previous {
+        apply(uid, &previous_backend, &cleaned)?;
+        save(uid, &previous_backend, &cleaned)?;
+        previous = cleaned;
+    }
     let response = match req["action"].as_str() {
         Some("status") if req.as_object().is_some_and(|obj| obj.len() == 1) => {
             let active = installed(uid, &previous_backend, &previous)?;
@@ -472,7 +498,7 @@ pub fn helper() -> Result<(), String> {
             json!({"backend":previous_backend,"selected_backend":chosen,"networks":previous.iter().map(ToString::to_string).collect::<Vec<_>>(), "active": active})
         }
         Some("apply") if req.as_object().is_some_and(|obj| obj.len() == 2) => {
-            let desired = parse_networks(&req["networks"])?;
+            let desired = crate::networks::game_networks(&parse_networks(&req["networks"])?);
             let selected = backend()?;
             apply(uid, selected, &desired)?;
             if selected != previous_backend && !previous.is_empty() {
@@ -569,8 +595,9 @@ mod tests {
     }
 
     #[test]
-    fn nft_supplemented_peers_are_blocked_without_blocking_neighbors() {
-        if std::env::var_os("DROPSHIT_KERNEL_PACKET_TEST").is_none() {
+    fn regional_subnets_block_pool_and_migrate_voice_blocks() {
+        let iptables = std::env::var_os("DROPSHIT_KERNEL_IPTABLES").is_some();
+        if !iptables && std::env::var_os("DROPSHIT_KERNEL_PACKET_TEST").is_none() {
             return;
         }
         let uid = unsafe { libc::getuid() };
@@ -578,8 +605,11 @@ mod tests {
         for host in [
             "66.40.191.240",
             "66.40.191.241",
+            "66.40.190.241",
+            "5.42.175.1",
+            "5.42.176.1",
             "85.236.97.71",
-            "85.236.97.72",
+            "85.236.104.1",
         ] {
             command(
                 "/usr/sbin/ip",
@@ -588,14 +618,31 @@ mod tests {
             )
             .unwrap();
         }
-        let nets = parse_networks(&json!(["66.40.191.240/32", "85.236.97.71/32"])).unwrap();
-        nft_apply(uid, &nets).unwrap();
-        assert!(installed(uid, "nftables", &nets).unwrap());
+        let old = parse_networks(&json!(["85.236.97.71/32"])).unwrap();
+        let backend = if iptables { "iptables" } else { "nftables" };
+        if iptables {
+            iptables_apply(uid, &old).unwrap();
+        } else {
+            nft_apply(uid, &old).unwrap();
+        }
+        let nets = parse_networks(&json!([
+            "66.40.191.0/24",
+            "5.42.168.0/21",
+            "85.236.96.0/21",
+            "85.236.104.0/23"
+        ]))
+        .unwrap();
+        apply(uid, backend, &nets).unwrap();
+        let cleaned = crate::networks::game_networks(&nets);
+        assert!(installed(uid, backend, &cleaned).unwrap());
         for (host, blocked) in [
             ("66.40.191.240", true),
-            ("66.40.191.241", false),
-            ("85.236.97.71", true),
-            ("85.236.97.72", false),
+            ("66.40.191.241", true),
+            ("66.40.190.241", false),
+            ("5.42.175.1", true),
+            ("5.42.176.1", false),
+            ("85.236.97.71", false),
+            ("85.236.104.1", false),
         ] {
             for port in [11999, 26542, 43422, 64001] {
                 let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -605,7 +652,7 @@ mod tests {
                 );
             }
         }
-        nft_apply(uid, &[]).unwrap();
+        apply(uid, backend, &[]).unwrap();
     }
 
     #[test]

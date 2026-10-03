@@ -1,32 +1,41 @@
-# Exact-address supplements
+# Regional subnet supplements and voice exclusions
 
-Dropshit supplements the external game-network feed with these **exact /32s**,
-reported by a user as live Overwatch peers and absent from the feed at review.
-No surrounding allocation is blocked by this supplement.
+Reviewed 2026-10-03. These supplements accompany the external game-network feed:
 
-| Peer | Geographic grouping in Dropshit | Ownership | Reviewed |
-| --- | --- | --- | --- |
-| `66.40.191.240/32` | Netherlands (`ams1`) | AS57976, Blizzard Entertainment | 2026-10-03 |
-| `85.236.97.71/32` | US east (`gue4`) | AS35028, Unity Technologies ApS | 2026-10-03 |
+| CIDR | Group | Evidence and limitations |
+| --- | --- | --- |
+| `66.40.191.0/24` | Netherlands (`ams1`) | RIPEstat currently reports this route originated by AS57976 Blizzard. User observed `66.40.191.240`; IPinfo and ipwho.is place that peer in Amsterdam. Classification of the entire route as an Amsterdam game pool remains an inference. |
+| `5.42.168.0/21` | Netherlands (`ams1`) | MINA's Amsterdam configuration lists `5.42.168.0–5.42.175.255`. The current route for `.168.1` is `5.42.168.0/22`, AS57976, with Amsterdam geolocation. The broader /21 comes from a community list, not a fresh Blizzard guarantee. |
 
-Both IPinfo and ipwho.is returned Amsterdam, Netherlands for the first address
-and Boston, Massachusetts, US for the second:
+Sources:
 
+- https://stat.ripe.net/data/network-info/data.json?resource=66.40.191.240
+- https://rdap.arin.net/registry/ip/66.40.191.240
 - https://ipinfo.io/66.40.191.240/json
 - https://ipwho.is/66.40.191.240
-- https://ipinfo.io/85.236.97.71/json
-- https://ipwho.is/85.236.97.71
+- https://github.com/foryVERX/Overwatch-Server-Selector/blob/main/ip_lists/cfg%20-%20EU%20-%20Netherlands%20-%20AMS1.txt
+- https://stat.ripe.net/data/network-info/data.json?resource=5.42.168.1
+- https://ipinfo.io/5.42.168.1/json
 
-These databases provide a geographic estimate, not proof of a physical server
-location or its matchmaker datacenter code. `gue4` is the existing UI's US-east
-grouping; the Boston peer is not verified as a `gue4` game server. The Unity
-address may carry voice/service traffic. Blocking that region also blocks this
-peer's UDP ports 12000–64000 and may interrupt voice communication. TCP and UDP
-outside that port range remain unaffected.
+The registered Blizzard allocation `66.40.176.0/20` is not blocked wholesale:
+ownership does not establish that all its addresses belong to this game region.
+The community EU lists include Finland and other locations; they cannot be
+assigned wholesale to Amsterdam while preserving Finland-only selection.
 
-The additions use the same selection, apply, nftables/iptables and persistence
-paths as the external CIDRs. A subsequent upstream CIDR containing a peer
-supersedes its extra /32. A saved selection with outdated network coverage is
-marked as unapplied: press `a` to update it after upgrading or refreshing data.
-Finland-only is still a blocklist of known other regions, not an allowlist of
-every possible Overwatch destination.
+## Vivox must never be a game-region block
+
+The [official Unity article](https://support.unity.com/hc/en-us/articles/4407491745940-Vivox-What-IPs-and-ports-are-required-for-Vivox-to-work), updated August 6, 2026,
+identifies `85.236.96.0/21` and `85.236.104.0/23` as Vivox ranges, using UDP
+12000–54000 for voice media. The previous `85.236.97.71/32` US-east addition
+was misclassified and has been removed.
+
+Both the TUI data loader and privileged helper subtract these ranges, including
+from a larger enclosing CIDR. These are exclusions from Dropshit's own rules,
+not ACCEPT rules overriding the system firewall. Startup authenticated status
+checks and boot restore clean old saved voice blocks and update saved state.
+After upgrading, reopen Dropshit and authorize its initial status check; press
+`a` if warned to refresh the saved regional coverage. New subnet additions only
+enter active rules when you apply your selection.
+
+Rules remain per-user UDP destination ports 12000–64000. Finland-only is a
+blocklist of known other regions, not an allowlist of every Overwatch endpoint.

@@ -1,5 +1,6 @@
 mod client;
 mod data;
+mod networks;
 
 use crossterm::{
     cursor,
@@ -175,19 +176,22 @@ impl App {
                     self.blocked = self
                         .regions
                         .iter()
-                        .filter(|r| r.networks.iter().any(|n| reply.networks.contains(n)))
+                        .filter(|r| {
+                            r.networks.iter().any(|n| {
+                                reply.networks.iter().any(|saved| {
+                                    saved.contains(&n.addr()) || n.contains(&saved.addr())
+                                })
+                            })
+                        })
                         .map(|r| r.code.clone())
                         .collect();
-                    let needs_update = self
+                    let wanted: Vec<_> = self
                         .regions
                         .iter()
                         .filter(|r| self.blocked.contains(&r.code))
-                        .flat_map(|r| &r.networks)
-                        .any(|n| {
-                            !reply.networks.iter().any(|saved| {
-                                saved.prefix_len() <= n.prefix_len() && saved.contains(&n.addr())
-                            })
-                        });
+                        .flat_map(|r| r.networks.iter().copied())
+                        .collect();
+                    let needs_update = networks::game_networks(&wanted) != reply.networks;
                     if needs_update {
                         self.dirty = true;
                         self.revision += 1;
@@ -504,6 +508,33 @@ mod layout_tests {
         ));
         assert!(!app.dirty);
         assert!(app.firewall_state.contains("активно"));
+    }
+
+    #[test]
+    fn stale_removed_networks_require_reapply_even_when_current_coverage_is_complete() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.regions = vec![Region {
+            code: "gue4".into(),
+            title: "US east".into(),
+            url: String::new(),
+            networks: vec!["34.86.0.0/16".parse().unwrap()],
+            legacy: false,
+        }];
+        app.event(Message::Firewall(
+            false,
+            Ok(client::Reply {
+                backend: "nftables".into(),
+                selected_backend: "nftables".into(),
+                active: true,
+                networks: vec![
+                    "34.86.0.0/16".parse().unwrap(),
+                    "85.236.97.71/32".parse().unwrap(),
+                ],
+            }),
+        ));
+        assert!(app.blocked.contains("gue4"));
+        assert!(app.dirty);
     }
 
     #[test]

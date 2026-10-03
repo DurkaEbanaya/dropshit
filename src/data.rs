@@ -6,10 +6,9 @@ use serde_json::Value;
 pub const IPS_URL: &str = "https://stowmyy.github.io/dropship/ips.json";
 pub const ENDPOINTS_URL: &str = "https://gcping.com/api/endpoints";
 
-// Exact user-observed peers missing from the external feed. Geographic grouping,
-// not confirmation of an Overwatch datacenter code; see docs/address-supplements.md.
+// Research-backed candidates; regional evidence/limitations documented separately.
 const ADDRESS_SUPPLEMENTS: &[(&str, &str)] =
-    &[("ams1", "66.40.191.240/32"), ("gue4", "85.236.97.71/32")];
+    &[("ams1", "66.40.191.0/24"), ("ams1", "5.42.168.0/21")];
 
 pub const REGIONS: &[(&str, &str, &str)] = &[
     ("ams1", "Нидерланды", "europe-west4"),
@@ -86,15 +85,15 @@ pub fn parse_regions(ips: &Value, endpoints: &Value) -> Result<Vec<Region>, Stri
         for &(region, cidr) in ADDRESS_SUPPLEMENTS {
             if region == code {
                 let net: IpNet = cidr.parse().map_err(|e| format!("{code}: {e}"))?;
-                // If the feed later includes this peer, do not add an overlapping /32.
-                if !networks
-                    .iter()
-                    .any(|existing| existing.contains(&net.addr()))
-                {
+                // A smaller feed CIDR must not hide the rest of a supplement.
+                if !networks.iter().any(|existing| {
+                    existing.prefix_len() <= net.prefix_len() && existing.contains(&net.addr())
+                }) {
                     networks.push(net);
                 }
             }
         }
+        networks = crate::networks::game_networks(&networks);
         let url = endpoints
             .get(key)
             .and_then(|e| e.get("URL"))
@@ -273,29 +272,33 @@ mod tests {
     }
 
     #[test]
-    fn observed_peers_are_blockable_in_only_their_geographic_region() {
-        let (ips, endpoints) = fixtures();
+    fn regional_subnets_cover_pool_but_never_vivox() {
+        let (mut ips, endpoints) = fixtures();
+        ips["servers"]["overwatch"][6]["block"] = "85.236.0.0/16,192.0.2.7/32".into();
         let regions = parse_regions(&ips, &endpoints).unwrap();
-        for (host, code) in [("66.40.191.240", "ams1"), ("85.236.97.71", "gue4")] {
+        for host in [
+            "66.40.191.1",
+            "66.40.191.240",
+            "66.40.191.254",
+            "5.42.168.1",
+            "5.42.175.254",
+        ] {
             let ip: IpAddr = host.parse().unwrap();
             let matches: Vec<_> = regions
                 .iter()
                 .filter(|r| r.networks.iter().any(|n| n.contains(&ip)))
                 .collect();
             assert_eq!(matches.len(), 1);
-            assert_eq!(matches[0].code, code);
-            assert!(
-                matches[0]
-                    .networks
-                    .iter()
-                    .any(|n| n.addr() == ip && n.prefix_len() == 32)
-            );
+            assert_eq!(matches[0].code, "ams1");
         }
         for host in [
-            "66.40.191.239",
-            "66.40.191.241",
+            "66.40.190.255",
+            "66.40.192.0",
+            "5.42.167.255",
+            "5.42.176.0",
             "85.236.97.70",
             "85.236.97.72",
+            "85.236.104.5",
         ] {
             let ip: IpAddr = host.parse().unwrap();
             assert!(
@@ -308,18 +311,21 @@ mod tests {
 ESTAB 0 0 192.168.1.3:42001 85.236.97.71:43422 users:((\"Overwatch.exe\",pid=1,fd=3))\n";
         let counts = parse_overwatch_flows(flows, &regions);
         assert_eq!(counts["ams1"], 1);
-        assert_eq!(counts["gue4"], 1);
+        assert!(!counts.contains_key("gue4"));
         assert!(!counts.contains_key("gen1"));
     }
 
     #[test]
-    fn feed_coverage_supersedes_exact_supplements() {
+    fn narrower_feed_cannot_hide_regional_pool() {
         let (mut ips, endpoints) = fixtures();
-        ips["servers"]["overwatch"][0]["block"] = "66.40.191.0/24".into();
+        ips["servers"]["overwatch"][0]["block"] = "66.40.191.240/32".into();
         let regions = parse_regions(&ips, &endpoints).unwrap();
         assert_eq!(
             regions[0].networks,
-            vec!["66.40.191.0/24".parse::<IpNet>().unwrap()]
+            crate::networks::game_networks(&[
+                "66.40.191.0/24".parse().unwrap(),
+                "5.42.168.0/21".parse().unwrap()
+            ])
         );
     }
     #[test]
