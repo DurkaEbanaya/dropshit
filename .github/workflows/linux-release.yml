@@ -75,6 +75,11 @@ jobs:
         with:
           name: deb-rpm-source
           path: dist
+      - name: Use current HTTPS openSUSE mirror
+        run: |
+          for repo in /etc/zypp/repos.d/*.repo; do
+            sed -i 's|http://download.opensuse.org/|https://download.opensuse.org/|g' "$repo"
+          done
       - run: zypper --non-interactive --no-gpg-checks install --dry-run "$(pwd)/dist/dropshit-0.1.1-1.x86_64.rpm"
 
   release:
