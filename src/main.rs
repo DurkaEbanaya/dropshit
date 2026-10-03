@@ -129,19 +129,48 @@ impl App {
             self.status = "Нельзя заблокировать все игровые регионы".into();
             return;
         }
-        let nets: Vec<_> = self
-            .regions
-            .iter()
-            .filter(|r| self.blocked.contains(&r.code))
-            .flat_map(|r| r.networks.iter().copied())
-            .collect();
+        let policy = self.policy();
         let tx = self.tx.clone();
-        self.firewall_state = "применение…".into();
+        self.firewall_state = format!("применение {}…", policy.mode());
         self.applied_revision = self.revision;
         self.applying = true;
         thread::spawn(move || {
-            let _ = tx.send(Message::Firewall(true, client::send("apply", &nets)));
+            let _ = tx.send(Message::Firewall(
+                true,
+                client::send_policy("apply", &policy),
+            ));
         });
+    }
+
+    fn policy(&self) -> networks::Policy {
+        let allowed: Vec<_> = self
+            .regions
+            .iter()
+            .filter(|r| !r.legacy && !self.blocked.contains(&r.code))
+            .collect();
+        let strict = allowed.len() == 1;
+        let nets: Vec<_> = self
+            .regions
+            .iter()
+            .filter(|r| {
+                !r.legacy
+                    && if strict {
+                        r.code == allowed[0].code
+                    } else {
+                        self.blocked.contains(&r.code)
+                    }
+            })
+            .flat_map(|r| r.networks.iter().copied())
+            .collect();
+        networks::Policy {
+            strict,
+            region: if strict {
+                Some(allowed[0].code.clone())
+            } else {
+                None
+            },
+            networks: networks::game_networks(&nets),
+        }
     }
 
     fn event(&mut self, message: Message) {
@@ -173,25 +202,29 @@ impl App {
                     self.pending_status = false;
                 }
                 if !applied && !self.dirty {
-                    self.blocked = self
-                        .regions
-                        .iter()
-                        .filter(|r| {
-                            r.networks.iter().any(|n| {
-                                reply.networks.iter().any(|saved| {
-                                    saved.contains(&n.addr()) || n.contains(&saved.addr())
+                    self.blocked = if reply.strict {
+                        self.regions
+                            .iter()
+                            .filter(|r| !r.legacy && Some(&r.code) != reply.region.as_ref())
+                            .map(|r| r.code.clone())
+                            .collect()
+                    } else {
+                        self.regions
+                            .iter()
+                            .filter(|r| {
+                                r.networks.iter().any(|n| {
+                                    reply.networks.iter().any(|saved| {
+                                        saved.contains(&n.addr()) || n.contains(&saved.addr())
+                                    })
                                 })
                             })
-                        })
-                        .map(|r| r.code.clone())
-                        .collect();
-                    let wanted: Vec<_> = self
-                        .regions
-                        .iter()
-                        .filter(|r| self.blocked.contains(&r.code))
-                        .flat_map(|r| r.networks.iter().copied())
-                        .collect();
-                    let needs_update = networks::game_networks(&wanted) != reply.networks;
+                            .map(|r| r.code.clone())
+                            .collect()
+                    };
+                    let wanted = self.policy();
+                    let needs_update = wanted.strict != reply.strict
+                        || wanted.region != reply.region
+                        || wanted.networks != reply.networks;
                     if needs_update {
                         self.dirty = true;
                         self.revision += 1;
@@ -204,11 +237,16 @@ impl App {
                             reply.backend, reply.selected_backend
                         )
                     } else if self.dirty {
-                        "ВНИМАНИЕ: выбор ещё НЕ применён к брандмауэру (a)".into()
+                        "Изменения ожидают автоматического применения".into()
                     } else if reply.active {
                         format!(
-                            "{}: {} игровых сетей активно",
+                            "{} {}: {} сетей активно",
                             reply.backend,
+                            if reply.strict {
+                                format!("ТОЛЬКО {} + Vivox", reply.region.as_deref().unwrap_or("?"))
+                            } else {
+                                "блоклист".into()
+                            },
                             reply.networks.len()
                         )
                     } else {
@@ -221,7 +259,7 @@ impl App {
                 } else {
                     self.pending_status = false;
                 }
-                self.firewall_state = format!("ВНИМАНИЕ: {e}");
+                self.firewall_state = format!("ВНИМАНИЕ: {e}; a — повторить");
             }
         }
     }
@@ -405,7 +443,7 @@ impl App {
         } else {
             screen.push(fit("Ожидание данных о регионах…", width));
         }
-        screen.push(fit("↑↓  Space блок  a применить  u снять  q выход", width));
+        screen.push(fit("↑↓  Space автоблок  u снять  a повтор  q выход", width));
         screen.push(fit(
             "p/r HTTPS  c авто  s правила  R список  d детали",
             width,
@@ -475,6 +513,43 @@ mod layout_tests {
     use super::*;
 
     #[test]
+    fn one_allowed_region_is_strict_two_are_blocklist_and_status_preserves_selection() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.regions = ["gen1", "ams1", "gue4"]
+            .iter()
+            .enumerate()
+            .map(|(i, code)| Region {
+                code: code.to_string(),
+                title: code.to_string(),
+                url: String::new(),
+                networks: vec![format!("192.0.2.{}/32", i + 1).parse().unwrap()],
+                legacy: false,
+            })
+            .collect();
+        app.blocked.insert("ams1".into());
+        assert!(!app.policy().strict);
+        app.blocked.insert("gue4".into());
+        let policy = app.policy();
+        assert!(policy.strict);
+        assert_eq!(policy.region.as_deref(), Some("gen1"));
+        app.blocked.clear();
+        app.event(Message::Firewall(
+            false,
+            Ok(client::Reply {
+                backend: "nftables".into(),
+                selected_backend: "nftables".into(),
+                strict: true,
+                region: Some("gen1".into()),
+                networks: policy.networks,
+                active: true,
+            }),
+        ));
+        assert_eq!(app.blocked, HashSet::from(["ams1".into(), "gue4".into()]));
+        assert!(!app.dirty);
+    }
+
+    #[test]
     fn saved_region_missing_new_peer_requires_reapply() {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(tx);
@@ -489,6 +564,8 @@ mod layout_tests {
             legacy: false,
         }];
         let reply = |networks: Vec<_>| client::Reply {
+            strict: false,
+            region: None,
             backend: "nftables".into(),
             selected_backend: "nftables".into(),
             networks,
@@ -500,7 +577,7 @@ mod layout_tests {
         ));
         assert!(app.blocked.contains("ams1"));
         assert!(app.dirty);
-        assert!(app.firewall_state.contains("НЕ применён"));
+        assert!(app.firewall_state.contains("автоматического"));
         app.applied_revision = app.revision;
         app.event(Message::Firewall(
             true,
@@ -524,6 +601,8 @@ mod layout_tests {
         app.event(Message::Firewall(
             false,
             Ok(client::Reply {
+                strict: false,
+                region: None,
                 backend: "nftables".into(),
                 selected_backend: "nftables".into(),
                 active: true,
@@ -586,7 +665,7 @@ mod layout_tests {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if std::env::args().any(|a| a == "--help") {
         println!(
-            "Dropshit TUI: стрелки — регион, пробел — блокировка, a — применить, u — снять, s — проверить правила, p/r — HTTPS-замер, c — постоянный замер, d — детали, n/b — игровые сети, R — обновить список, q — выход. Требуются curl, iproute2 и терминал."
+            "Dropshit TUI: стрелки — регион, пробел — автоматическая блокировка, a — повтор при ошибке, u — снять, s — проверить правила, p/r — HTTPS-замер, c — постоянный замер, d — детали, n/b — игровые сети, R — обновить список, q — выход. Один разрешённый регион: строгий allowlist + Vivox; два и более: блоклист. Требуются curl, iproute2 и терминал."
         );
         return Ok(());
     }
@@ -602,6 +681,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             redraw = true;
         }
         redraw |= app.tick();
+        if app.dirty
+            && !app.applying
+            && !app.pending_status
+            && !app.firewall_state.contains("a — повторить")
+        {
+            app.apply();
+            redraw = true;
+        }
         if last_flow_check.elapsed() >= Duration::from_secs(3) {
             let flows = data::observe_udp(&app.regions);
             if flows != app.flows {
@@ -635,14 +722,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(r) = app.regions.get(app.selected) {
                             if !r.legacy {
                                 let code = r.code.clone();
+                                if !app.blocked.contains(&code)
+                                    && app.blocked.len() + 1
+                                        >= app.regions.iter().filter(|r| !r.legacy).count()
+                                {
+                                    app.status = "Нужно оставить хотя бы один регион".into();
+                                    continue;
+                                }
                                 if !app.blocked.insert(code.clone()) {
                                     app.blocked.remove(&code);
                                 }
                                 app.revision = app.revision.wrapping_add(1);
                                 app.dirty = true;
-                                app.firewall_state =
-                                    "ВНИМАНИЕ: выбор ещё НЕ применён к брандмауэру (a)".into();
-                                app.status = "Выбор изменён; нажмите a для применения".into();
+                                app.status = "Автоматическое применение выбора".into();
+                                app.apply();
                             }
                         }
                     }

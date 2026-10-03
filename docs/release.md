@@ -1,9 +1,9 @@
-Dropshit 0.1.4 (x86_64): fix false "saved firewall rules missing" warning with nftables.
+Dropshit 0.1.5: automatic strict single-region mode and automatic application.
 
-nftables automatically merges adjacent CIDRs into larger prefixes or address ranges. Status checks now read structured nft JSON and compare the actual IPv4/IPv6 address coverage instead of searching for the original CIDR strings. The output hook, owner UID, destination sets, UDP port range and rejection rule are checked too. Missing/changed rules still produce a warning. Existing selections and rules are preserved; no reapplication is required just to fix the status display.
+- Exactly one game region left allowed: permit its networks and Vivox, reject all other destinations for the user's UDP ports 12000–64000, including unlisted relays.
+- Two or more game regions left allowed: use the existing regional blocklist.
+- Space toggles and automatically applies changes. No separate apply confirmation; a single authenticated helper session handles serial updates. `a` remains a retry shortcut after errors.
+- Mode, single-region code and network data persist; boot restore, backend migration and clearing support both modes. Old blocklists load compatibly and migrate automatically when only one region remains.
+- Packet tests exercise IPv4/IPv6, Vivox, unknown endpoints, TCP and UDP boundaries, strict/blocklist/clear transitions on nftables and iptables.
 
-Includes 0.1.3's Amsterdam subnet supplements and official Vivox exclusions. Real isolated-kernel regression tests cover merged prefixes, arbitrary ranges, IPv6 and missing/altered rules.
-
-Packages: DEB for Debian 12+/Ubuntu 24.04+, separate RPMs for Fedora and openSUSE, and Arch `.pkg.tar.zst`. RPMs are unsigned; openSUSE installation: `sudo zypper --no-gpg-checks install ./dropshit-0.1.4-1.x86_64.rpm`.
-
-Binaries built on Debian 12 (glibc 2.36). Corresponding sources, source RPMs and `SHA256SUMS` are attached. Run `dropshit` as your normal desktop user; reopen after upgrading.
+Packages for Debian 12+/Ubuntu 24.04+, Fedora, openSUSE and Arch (x86_64), corresponding sources and SHA256SUMS are attached. openSUSE: `sudo zypper --no-gpg-checks install ./dropshit-0.1.5-1.x86_64.rpm`. Run `dropshit` as your regular desktop user.

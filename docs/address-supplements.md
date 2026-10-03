@@ -33,9 +33,8 @@ Both the TUI data loader and privileged helper subtract these ranges, including
 from a larger enclosing CIDR. These are exclusions from Dropshit's own rules,
 not ACCEPT rules overriding the system firewall. Startup authenticated status
 checks and boot restore clean old saved voice blocks and update saved state.
-After upgrading, reopen Dropshit and authorize its initial status check; press
-`a` if warned to refresh the saved regional coverage. New subnet additions only
-enter active rules when you apply your selection.
+After upgrading, reopen Dropshit and authorize its initial status check.
+Outdated selections are reapplied automatically; `a` retries after an error.
 
-Rules remain per-user UDP destination ports 12000–64000. Finland-only is a
-blocklist of known other regions, not an allowlist of every Overwatch endpoint.
+Rules remain per-user UDP destination ports 12000–64000. One allowed region
+uses its strict allowlist plus Vivox; two or more use the regional blocklist.

@@ -3,6 +3,59 @@ use ipnet::IpNet;
 // Official Vivox voice-media ranges, reviewed 2026-10-03. Never game blocks.
 pub const VIVOX: &[&str] = &["85.236.96.0/21", "85.236.104.0/23"];
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Policy {
+    pub strict: bool,
+    pub region: Option<String>,
+    // Blocked networks in ordinary mode; allowed game networks in strict mode.
+    pub networks: Vec<IpNet>,
+}
+
+impl Policy {
+    pub fn mode(&self) -> &'static str {
+        if self.strict {
+            "allowlist"
+        } else {
+            "blocklist"
+        }
+    }
+
+    #[allow(dead_code)] // Compiled for the helper; the TUI uses the policy description.
+    pub fn blocked_networks(&self) -> Vec<IpNet> {
+        if !self.strict {
+            return game_networks(&self.networks);
+        }
+        // Compile the allowlist to its exact complement. Both firewall backends
+        // then reject ONLY disallowed destinations, without overriding other rules.
+        let mut blocked = vec![
+            "0.0.0.0/0".parse::<IpNet>().unwrap(),
+            "::/0".parse().unwrap(),
+        ];
+        let allowed = self
+            .networks
+            .iter()
+            .copied()
+            .chain(VIVOX.iter().map(|s| s.parse().unwrap()));
+        for net in allowed {
+            blocked = blocked
+                .into_iter()
+                .flat_map(|part| subtract(part, net.trunc()))
+                .collect();
+        }
+        // Keep helper snapshots free of /0, including when the region is IPv4-only.
+        blocked
+            .into_iter()
+            .flat_map(|net| {
+                if net.prefix_len() == 0 {
+                    net.subnets(1).unwrap().collect()
+                } else {
+                    vec![net]
+                }
+            })
+            .collect()
+    }
+}
+
 pub fn game_networks(networks: &[IpNet]) -> Vec<IpNet> {
     let mut result: Vec<_> = networks.iter().map(IpNet::trunc).collect();
     for text in VIVOX {

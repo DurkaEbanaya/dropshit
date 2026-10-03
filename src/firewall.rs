@@ -1,12 +1,13 @@
 //! Privileged, per-UID firewall rules. This module is only compiled into the helper.
 use std::{
     fs,
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     path::Path,
     process::{Command, Stdio},
 };
 
+use crate::networks::Policy;
 use ipnet::IpNet;
 use serde_json::{Value, json};
 
@@ -288,7 +289,46 @@ fn state_path(uid: u32) -> String {
     format!("{STATE}/{uid}.json")
 }
 
-fn read_state(uid: u32) -> Result<Option<(String, Vec<IpNet>)>, String> {
+fn parse_policy(value: &Value) -> Result<Policy, String> {
+    let strict = match value["mode"].as_str() {
+        None if value.get("mode").is_none() => false,
+        Some("blocklist") => false,
+        Some("allowlist") => true,
+        _ => return Err("invalid policy mode".into()),
+    };
+    let region = match value.get("region") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s))
+            if !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            Some(s.clone())
+        }
+        _ => return Err("invalid region code".into()),
+    };
+    let nets = parse_networks(&value["networks"])?;
+    if strict && (region.is_none() || nets.is_empty()) {
+        return Err("allowlist requires a region and nonempty networks".into());
+    }
+    if !strict && region.is_some() {
+        return Err("blocklist has no single allowed region".into());
+    }
+    Ok(Policy {
+        strict,
+        region,
+        networks: nets,
+    })
+}
+
+fn apply_policy(uid: u32, backend: &str, policy: &Policy) -> Result<(), String> {
+    apply(uid, backend, &policy.blocked_networks())
+}
+
+fn policy_reply(backend: &str, chosen: &str, policy: &Policy, active: bool) -> Value {
+    json!({"backend":backend,"selected_backend":chosen,"mode":policy.mode(),"region":policy.region,
+        "networks":policy.networks.iter().map(ToString::to_string).collect::<Vec<_>>(),"active":active})
+}
+
+fn read_state(uid: u32) -> Result<Option<(String, Policy)>, String> {
     let text = match fs::read_to_string(state_path(uid)) {
         Ok(text) => text,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -299,12 +339,12 @@ fn read_state(uid: u32) -> Result<Option<(String, Vec<IpNet>)>, String> {
     if !["nftables", "iptables"].contains(&backend) {
         return Err("invalid saved backend".into());
     }
-    Ok(Some((backend.into(), parse_networks(&value["networks"])?)))
+    Ok(Some((backend.into(), parse_policy(&value)?)))
 }
 
-fn save(uid: u32, backend: &str, nets: &[IpNet]) -> Result<(), String> {
+fn save(uid: u32, backend: &str, policy: &Policy) -> Result<(), String> {
     let path = state_path(uid);
-    if nets.is_empty() {
+    if !policy.strict && policy.networks.is_empty() {
         match fs::remove_file(path) {
             Ok(()) => (),
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
@@ -319,7 +359,12 @@ fn save(uid: u32, backend: &str, nets: &[IpNet]) -> Result<(), String> {
                 .mode(0o600)
                 .open(&temp)
                 .map_err(|e| e.to_string())?;
-            file.write_all(json!({"backend": backend, "networks": nets.iter().map(ToString::to_string).collect::<Vec<_>>()}).to_string().as_bytes()).map_err(|e| e.to_string())?;
+            file.write_all(
+                policy_reply(backend, backend, policy, true)
+                    .to_string()
+                    .as_bytes(),
+            )
+            .map_err(|e| e.to_string())?;
             file.sync_all().map_err(|e| e.to_string())?;
             fs::rename(&temp, path).map_err(|e| e.to_string())
         })();
@@ -532,7 +577,7 @@ pub fn helper() -> Result<(), String> {
             let _held = lock(uid)?;
             if let Some((old_backend, _)) = read_state(uid)? {
                 apply(uid, &old_backend, &[])?;
-                save(uid, &old_backend, &[])?;
+                save(uid, &old_backend, &Policy::default())?;
             }
             return Ok(());
         }
@@ -549,21 +594,45 @@ pub fn helper() -> Result<(), String> {
                 continue;
             };
             let _held = lock(uid)?;
-            if let Some((old_backend, nets)) = read_state(uid)? {
-                let cleaned = crate::networks::game_networks(&nets);
-                apply(uid, &old_backend, &cleaned)?;
-                if cleaned != nets {
+            if let Some((old_backend, policy)) = read_state(uid)? {
+                let cleaned = Policy {
+                    networks: crate::networks::game_networks(&policy.networks),
+                    ..policy.clone()
+                };
+                apply_policy(uid, &old_backend, &cleaned)?;
+                if cleaned != policy {
                     save(uid, &old_backend, &cleaned)?;
                 }
             }
         }
         return Ok(());
     }
+    if args.len() == 2 && args[1] == "--session" {
+        let uid = caller_uid()?;
+        let mut input = io::stdin().lock();
+        loop {
+            let mut line = String::new();
+            let size = (&mut input)
+                .take(MAX_REQUEST + 1)
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            if size == 0 {
+                return Ok(());
+            }
+            if size as u64 > MAX_REQUEST {
+                return Err("request too large".into());
+            }
+            match handle_request(uid, &line) {
+                Ok(reply) => println!("{reply}"),
+                Err(e) => println!("{}", json!({"error":e})),
+            }
+            io::stdout().flush().map_err(|e| e.to_string())?;
+        }
+    }
     if args.len() != 1 {
         return Err("invalid helper arguments".into());
     }
     let uid = caller_uid()?;
-    let _held = lock(uid)?;
     let mut text = String::new();
     io::stdin()
         .take(MAX_REQUEST + 1)
@@ -572,66 +641,199 @@ pub fn helper() -> Result<(), String> {
     if text.len() as u64 > MAX_REQUEST {
         return Err("request too large".into());
     }
-    let req: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    println!("{}", handle_request(uid, &text)?);
+    Ok(())
+}
+
+fn handle_request(uid: u32, text: &str) -> Result<Value, String> {
+    let _held = lock(uid)?;
+    let req: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let valid = match req["action"].as_str() {
         Some("status") => req.as_object().is_some_and(|obj| obj.len() == 1),
-        Some("apply") => req
-            .as_object()
-            .is_some_and(|obj| obj.len() == 2 && obj.contains_key("networks")),
+        Some("apply") => req.as_object().is_some_and(|obj| {
+            obj.contains_key("networks")
+                && obj
+                    .keys()
+                    .all(|k| ["action", "networks", "mode", "region"].contains(&k.as_str()))
+        }),
         _ => false,
     };
     if !valid {
         return Err("invalid action or request fields".into());
     }
     if req["action"] == "apply" {
-        parse_networks(&req["networks"])?;
+        parse_policy(&req)?;
     }
     let (previous_backend, mut previous) = match read_state(uid)? {
         Some(saved) => saved,
-        None => (backend()?.into(), vec![]),
+        None => (backend()?.into(), Policy::default()),
     };
     // Migrate saved voice blocks on the first authenticated check as well as boot.
-    let cleaned = crate::networks::game_networks(&previous);
+    let cleaned = Policy {
+        networks: crate::networks::game_networks(&previous.networks),
+        ..previous.clone()
+    };
     if cleaned != previous {
-        apply(uid, &previous_backend, &cleaned)?;
+        apply_policy(uid, &previous_backend, &cleaned)?;
         save(uid, &previous_backend, &cleaned)?;
         previous = cleaned;
     }
     let response = match req["action"].as_str() {
         Some("status") if req.as_object().is_some_and(|obj| obj.len() == 1) => {
-            let active = installed(uid, &previous_backend, &previous)?;
+            let active = installed(uid, &previous_backend, &previous.blocked_networks())?;
             let chosen = backend()?;
-            json!({"backend":previous_backend,"selected_backend":chosen,"networks":previous.iter().map(ToString::to_string).collect::<Vec<_>>(), "active": active})
+            policy_reply(&previous_backend, chosen, &previous, active)
         }
-        Some("apply") if req.as_object().is_some_and(|obj| obj.len() == 2) => {
-            let desired = crate::networks::game_networks(&parse_networks(&req["networks"])?);
+        Some("apply") => {
+            let mut desired = parse_policy(&req)?;
+            desired.networks = crate::networks::game_networks(&desired.networks);
+            if desired.strict && desired.networks.is_empty() {
+                return Err("allowlist has no game networks".into());
+            }
             let selected = backend()?;
-            apply(uid, selected, &desired)?;
-            if selected != previous_backend && !previous.is_empty() {
+            apply_policy(uid, selected, &desired)?;
+            if selected != previous_backend && (previous.strict || !previous.networks.is_empty()) {
                 if let Err(e) = apply(uid, &previous_backend, &[]) {
                     let _ = apply(uid, selected, &[]);
                     return Err(format!("cannot migrate old backend: {e}"));
                 }
             }
             if let Err(e) = save(uid, selected, &desired) {
-                let _ = apply(uid, &previous_backend, &previous);
+                let _ = apply_policy(uid, &previous_backend, &previous);
                 if selected != previous_backend {
                     let _ = apply(uid, selected, &[]);
                 }
                 return Err(e);
             }
-            let active = installed(uid, selected, &desired)?;
-            json!({"backend":selected,"networks":desired.iter().map(ToString::to_string).collect::<Vec<_>>(), "active": active})
+            let active = installed(uid, selected, &desired.blocked_networks())?;
+            policy_reply(selected, selected, &desired, active)
         }
         _ => return Err("invalid action or request fields".into()),
     };
-    println!("{response}");
-    Ok(())
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn policy_state_is_backward_compatible_and_strict_mode_roundtrips() {
+        let old = parse_policy(&json!({"backend":"nftables","networks":["192.0.2.0/24"]})).unwrap();
+        assert!(!old.strict);
+        let policy = Policy {
+            strict: true,
+            region: Some("gen1".into()),
+            networks: vec!["34.88.0.0/16".parse().unwrap()],
+        };
+        assert_eq!(
+            parse_policy(&policy_reply("nftables", "nftables", &policy, true)).unwrap(),
+            policy
+        );
+        assert!(parse_policy(&json!({"mode":"allowlist","region":"gen1","networks":[]})).is_err());
+        assert!(parse_policy(&json!({"mode":"bad","networks":[]})).is_err());
+    }
+
+    #[test]
+    fn strict_policy_packets_switch_restore_and_clear() {
+        let iptables = std::env::var_os("DROPSHIT_KERNEL_IPTABLES").is_some();
+        if !iptables && std::env::var_os("DROPSHIT_KERNEL_PACKET_TEST").is_none() {
+            return;
+        }
+        let backend = if iptables { "iptables" } else { "nftables" };
+        let uid = unsafe { libc::getuid() };
+        command("/usr/sbin/ip", &["link", "set", "lo", "up"], None).unwrap();
+        let hosts = [
+            "34.88.201.2",
+            "85.236.97.71",
+            "85.236.104.1",
+            "137.221.86.97",
+            "192.0.2.1",
+            "2600:1900:4150::1",
+            "2001:db8::1",
+        ];
+        for host in hosts {
+            let suffix = if host.contains(':') { 128 } else { 32 };
+            command(
+                "/usr/sbin/ip",
+                &["addr", "add", &format!("{host}/{suffix}"), "dev", "lo"],
+                None,
+            )
+            .unwrap();
+        }
+        let strict = Policy {
+            strict: true,
+            region: Some("gen1".into()),
+            networks: vec![
+                "34.88.0.0/16".parse().unwrap(),
+                "2600:1900:4150::/44".parse().unwrap(),
+            ],
+        };
+        command(NFT, &["add", "table", "inet", "foreign_strict_test"], None).unwrap();
+        for iteration in 0..4 {
+            let policy = match iteration {
+                0 | 2 => strict.clone(),
+                1 => Policy {
+                    networks: vec!["137.221.86.0/24".parse().unwrap()],
+                    ..Policy::default()
+                },
+                _ => Policy::default(),
+            };
+            let restored = parse_policy(&policy_reply(backend, backend, &policy, true)).unwrap();
+            apply_policy(uid, backend, &restored).unwrap();
+            assert!(installed(uid, backend, &policy.blocked_networks()).unwrap());
+            for (index, host) in hosts.iter().enumerate() {
+                let denied = if policy.strict {
+                    [3, 4, 6].contains(&index)
+                } else {
+                    iteration == 1 && index == 3
+                };
+                for port in [11999, 12000, 29503, 43422, 64000, 64001] {
+                    let target = if host.contains(':') {
+                        format!("[{host}]:{port}")
+                    } else {
+                        format!("{host}:{port}")
+                    };
+                    let listener = std::net::UdpSocket::bind(&target).unwrap();
+                    listener
+                        .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                        .unwrap();
+                    let socket = std::net::UdpSocket::bind(if host.contains(':') {
+                        "[::]:0"
+                    } else {
+                        "0.0.0.0:0"
+                    })
+                    .unwrap();
+                    let reject = denied && (12000..=64000).contains(&port);
+                    assert_eq!(
+                        socket.send_to(&[1], &target).is_err(),
+                        reject,
+                        "{iteration}: {target}"
+                    );
+                    let mut buf = [0];
+                    assert_eq!(
+                        listener.recv(&mut buf).is_ok(),
+                        !reject,
+                        "delivery {target}"
+                    );
+                }
+                let addr = if host.contains(':') {
+                    format!("[{host}]:35000")
+                } else {
+                    format!("{host}:35000")
+                };
+                let listener = std::net::TcpListener::bind(&addr).unwrap();
+                assert!(
+                    std::net::TcpStream::connect_timeout(
+                        &addr.parse().unwrap(),
+                        std::time::Duration::from_millis(200)
+                    )
+                    .is_ok()
+                );
+                drop(listener);
+            }
+        }
+        assert!(command(NFT, &["list", "table", "inet", "foreign_strict_test"], None).is_ok());
+    }
     #[test]
     fn interval_comparison_preserves_holes_and_full_ipv6_range() {
         assert_eq!(
