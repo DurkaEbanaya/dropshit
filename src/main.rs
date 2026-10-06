@@ -224,7 +224,8 @@ impl App {
                     let wanted = self.policy();
                     let needs_update = wanted.strict != reply.strict
                         || wanted.region != reply.region
-                        || wanted.networks != reply.networks;
+                        || wanted.networks != reply.networks
+                        || (!reply.active && !reply.networks.is_empty());
                     if needs_update {
                         self.dirty = true;
                         self.revision += 1;
@@ -243,7 +244,10 @@ impl App {
                             "{} {}: {} сетей активно",
                             reply.backend,
                             if reply.strict {
-                                format!("ТОЛЬКО {} + Vivox", reply.region.as_deref().unwrap_or("?"))
+                                format!(
+                                    "ТОЛЬКО {} + Vivox/Discord",
+                                    reply.region.as_deref().unwrap_or("?")
+                                )
                             } else {
                                 "блоклист".into()
                             },
@@ -614,6 +618,34 @@ mod layout_tests {
         ));
         assert!(app.blocked.contains("gue4"));
         assert!(app.dirty);
+    }
+
+    #[test]
+    fn obsolete_port_rules_trigger_automatic_reapply_without_changing_selection() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.regions = vec![Region {
+            code: "gen1".into(),
+            title: "Finland".into(),
+            url: String::new(),
+            networks: vec!["34.88.0.0/16".parse().unwrap()],
+            legacy: false,
+        }];
+        app.event(Message::Firewall(
+            false,
+            Ok(client::Reply {
+                backend: "nftables".into(),
+                selected_backend: "nftables".into(),
+                active: false,
+                networks: app.regions[0].networks.clone(),
+                strict: true,
+                region: Some("gen1".into()),
+            }),
+        ));
+        assert!(app.dirty);
+        assert!(app.blocked.is_empty());
+        assert!(app.policy().strict);
+        assert_eq!(app.policy().region.as_deref(), Some("gen1"));
     }
 
     #[test]

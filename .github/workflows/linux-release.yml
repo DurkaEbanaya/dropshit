@@ -7,6 +7,20 @@ permissions:
   contents: read
 
 jobs:
+  firewall-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y nftables iptables iproute2
+      - name: Discord exceptions and old-rule migration in isolated networks
+        run: |
+          sudo unshare --net env PATH="$PATH" HOME="$HOME" DROPSHIT_KERNEL_PACKET_TEST=1 \
+            cargo test --locked --bin dropshit-helper strict_policy_packets -- --nocapture
+          sudo unshare --net env PATH="$PATH" HOME="$HOME" DROPSHIT_KERNEL_IPTABLES=1 \
+            cargo test --locked --bin dropshit-helper strict_policy_packets -- --nocapture
+
   build:
     runs-on: ubuntu-24.04
     container: debian:12
@@ -88,7 +102,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, arch, fedora, opensuse]
+    needs: [build, arch, fedora, opensuse, firewall-tests]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

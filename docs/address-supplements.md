@@ -36,5 +36,7 @@ checks and boot restore clean old saved voice blocks and update saved state.
 After upgrading, reopen Dropshit and authorize its initial status check.
 Outdated selections are reapplied automatically; `a` retries after an error.
 
-Rules remain per-user UDP destination ports 12000–64000. One allowed region
-uses its strict allowlist plus Vivox; two or more use the regional blocklist.
+Rules match per-user UDP destination ports 12000–19293 and 19345–49999.
+Discord destination ports 1541, 19294–19344 and 50000–65535 are excluded.
+One allowed region uses its strict allowlist plus Vivox and Discord exceptions;
+two or more use the regional blocklist with the same exceptions.

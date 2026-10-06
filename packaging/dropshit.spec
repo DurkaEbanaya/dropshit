@@ -1,5 +1,5 @@
 Name:           dropshit
-Version:        0.1.5
+Version:        0.1.6
 Release:        1%{?dist}
 Summary:        Rust terminal game region selector with HTTPS latency estimates
 License:        GPL-3.0-only

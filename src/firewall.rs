@@ -14,6 +14,14 @@ use serde_json::{Value, json};
 const STATE: &str = "/var/lib/dropshit";
 const NFT: &str = "/usr/sbin/nft";
 const MAX_REQUEST: u64 = 262_144;
+// Game-port window minus the user-requested Discord media destination ports.
+// 1541 is already outside the window; 50000–50032 is inside 50000–65535.
+const FILTERED_PORTS: &[(u16, u16)] = &[(12000, 19293), (19345, 49999)];
+const DISCORD_PORTS: &str = "1541,19294:19344,50000:65535";
+
+fn discord_return(chain: &str) -> String {
+    format!("-A {chain} -p udp -m multiport --dports {DISCORD_PORTS} -j RETURN")
+}
 
 fn command(binary: &str, args: &[&str], input: Option<&str>) -> Result<String, String> {
     let mut child = Command::new(binary)
@@ -141,8 +149,11 @@ fn nft_script(uid: u32, networks: &[IpNet]) -> String {
     text += "chain output { type filter hook output priority -10; policy accept;\n";
     for (v4, name, family) in [(true, "blocked4", "ip"), (false, "blocked6", "ip6")] {
         if networks.iter().any(|n| n.addr().is_ipv4() == v4) {
-            text +=
-                &format!("meta skuid {uid} {family} daddr @{name} udp dport 12000-64000 reject\n");
+            for (first, last) in FILTERED_PORTS {
+                text += &format!(
+                    "meta skuid {uid} {family} daddr @{name} udp dport {first}-{last} reject\n"
+                );
+            }
         }
     }
     text + "}\n}\n"
@@ -154,7 +165,9 @@ fn nft_apply(uid: u32, networks: &[IpNet]) -> Result<(), String> {
 
 fn tool(family: u8, restore: bool) -> &'static str {
     #[cfg(test)]
-    if std::env::var_os("DROPSHIT_KERNEL_IPTABLES").is_some() {
+    if std::env::var_os("DROPSHIT_KERNEL_IPTABLES").is_some()
+        && Path::new("/tmp/opencode/dropshit-iptables/usr/sbin/iptables-nft").exists()
+    {
         return match (family, restore) {
             (4, false) => "/tmp/opencode/dropshit-iptables/usr/sbin/iptables-nft",
             (6, false) => "/tmp/opencode/dropshit-iptables/usr/sbin/ip6tables-nft",
@@ -172,7 +185,7 @@ fn tool(family: u8, restore: bool) -> &'static str {
     }
 }
 
-fn iptables_snapshot(uid: u32, family: u8) -> Result<(bool, bool, Vec<IpNet>), String> {
+fn iptables_snapshot(uid: u32, family: u8) -> Result<(bool, bool, Vec<IpNet>, bool), String> {
     let chain = format!("DSHT_{uid}");
     let output = command(tool(family, false), &["-w", "-S"], None)?;
     let exists = output.lines().any(|line| line == format!("-N {chain}"));
@@ -184,10 +197,15 @@ fn iptables_snapshot(uid: u32, family: u8) -> Result<(bool, bool, Vec<IpNet>), S
         return Err(format!("{chain}: jump exists without chain"));
     }
     let mut nets = Vec::new();
+    let mut protected = false;
     for line in output
         .lines()
         .filter(|line| line.starts_with(&format!("-A {chain} ")))
     {
+        if line == discord_return(&chain) && nets.is_empty() && !protected {
+            protected = true;
+            continue;
+        }
         let words: Vec<_> = line.split_whitespace().collect();
         if words.len() < 6
             || words[2] != "-d"
@@ -209,7 +227,7 @@ fn iptables_snapshot(uid: u32, family: u8) -> Result<(bool, bool, Vec<IpNet>), S
         nets.push(net);
     }
     // Don't silently treat a failed firewall query as a missing chain.
-    Ok((exists, attached, nets))
+    Ok((exists, attached, nets, protected))
 }
 
 fn iptables_write(
@@ -218,6 +236,7 @@ fn iptables_write(
     networks: &[IpNet],
     existed: bool,
     attached: bool,
+    protect_discord: bool,
 ) -> Result<(), String> {
     let chain = format!("DSHT_{uid}");
     let hook = format!("-p udp -m owner --uid-owner {uid} -m udp --dport 12000:64000 -j {chain}");
@@ -235,6 +254,9 @@ fn iptables_write(
             lines.push(format!("-N {chain}"));
         } else {
             lines.push(format!("-F {chain}"));
+        }
+        if protect_discord {
+            lines.push(discord_return(&chain));
         }
         for net in networks {
             lines.push(format!("-A {chain} -d {net} -j REJECT"));
@@ -265,10 +287,10 @@ fn iptables_apply(uid: u32, nets: &[IpNet]) -> Result<(), String> {
         .filter(|n| n.addr().is_ipv6())
         .copied()
         .collect();
-    iptables_write(uid, 4, &new4, old4.0, old4.1)?;
-    if let Err(error) = iptables_write(uid, 6, &new6, old6.0, old6.1) {
+    iptables_write(uid, 4, &new4, old4.0, old4.1, true)?;
+    if let Err(error) = iptables_write(uid, 6, &new6, old6.0, old6.1, true) {
         let current4 = iptables_snapshot(uid, 4)?;
-        iptables_write(uid, 4, &old4.2, current4.0, current4.1)
+        iptables_write(uid, 4, &old4.2, current4.0, current4.1, old4.3)
             .map_err(|rollback| format!("{error}; IPv4 rollback FAILED: {rollback}"))?;
         return Err(error);
     }
@@ -441,6 +463,20 @@ fn nft_installed_json(uid: u32, nets: &[IpNet], document: &Value) -> bool {
     }) {
         return false;
     }
+    // No extra rule may continue rejecting Discord after the corrected rules.
+    let expected_rules = FILTERED_PORTS.len()
+        * [true, false]
+            .iter()
+            .filter(|v4| nets.iter().any(|n| n.addr().is_ipv4() == **v4))
+            .count();
+    if objects
+        .iter()
+        .filter(|obj| owned(&obj["rule"]) && obj["rule"]["chain"] == "output")
+        .count()
+        != expected_rules
+    {
+        return false;
+    }
     for (v4, name, kind, protocol) in [
         (true, "blocked4", "ipv4_addr", "ip"),
         (false, "blocked6", "ipv6_addr", "ip6"),
@@ -474,22 +510,24 @@ fn nft_installed_json(uid: u32, nets: &[IpNet], document: &Value) -> bool {
         if merge_intervals(actual) != wanted {
             return false;
         }
-        let expected = json!([
-            {"match":{"op":"==","left":{"meta":{"key":"skuid"}},"right":uid}},
-            {"match":{"op":"==","left":{"payload":{"protocol":protocol,"field":"daddr"}},"right":format!("@{name}")}},
-            {"match":{"op":"==","left":{"payload":{"protocol":"udp","field":"dport"}},"right":{"range":[12000,64000]}}}
-        ]);
-        if !objects.iter().any(|obj| {
-            let rule = &obj["rule"];
-            owned(rule)
-                && rule["chain"] == "output"
-                && rule["expr"].as_array().is_some_and(|expr| {
-                    expr.len() == 4
-                        && expr[..3] == expected.as_array().unwrap()[..]
-                        && expr[3].get("reject").is_some()
-                })
-        }) {
-            return false;
+        for (first, last) in FILTERED_PORTS {
+            let expected = json!([
+                {"match":{"op":"==","left":{"meta":{"key":"skuid"}},"right":uid}},
+                {"match":{"op":"==","left":{"payload":{"protocol":protocol,"field":"daddr"}},"right":format!("@{name}")}},
+                {"match":{"op":"==","left":{"payload":{"protocol":"udp","field":"dport"}},"right":{"range":[first,last]}}}
+            ]);
+            if !objects.iter().any(|obj| {
+                let rule = &obj["rule"];
+                owned(rule)
+                    && rule["chain"] == "output"
+                    && rule["expr"].as_array().is_some_and(|expr| {
+                        expr.len() == 4
+                            && expr[..3] == expected.as_array().unwrap()[..]
+                            && expr[3].get("reject").is_some()
+                    })
+            }) {
+                return false;
+            }
         }
     }
     true
@@ -517,8 +555,8 @@ fn installed(uid: u32, backend: &str, nets: &[IpNet]) -> Result<bool, String> {
             if selected.is_empty() {
                 continue;
             }
-            let (exists, attached, actual) = iptables_snapshot(uid, family)?;
-            if !exists || !attached || selected.iter().any(|n| !actual.contains(n)) {
+            let (exists, attached, actual, protected) = iptables_snapshot(uid, family)?;
+            if !exists || !attached || !protected || selected.iter().any(|n| !actual.contains(n)) {
                 return Ok(false);
             }
         }
@@ -780,6 +818,23 @@ mod tests {
             };
             let restored = parse_policy(&policy_reply(backend, backend, &policy, true)).unwrap();
             apply_policy(uid, backend, &restored).unwrap();
+            if iteration == 0 {
+                // Simulate 0.1.5 rules with no Discord exception, then upgrade.
+                if iptables {
+                    let rule = discord_return(&format!("DSHT_{uid}")).replacen("-A ", "-D ", 1);
+                    let args: Vec<_> = rule.split_whitespace().collect();
+                    for family in [4, 6] {
+                        command(tool(family, false), &args, None).unwrap();
+                    }
+                } else {
+                    let legacy = nft_script(uid, &policy.blocked_networks())
+                        .replace("12000-19293", "12000-64000")
+                        .replace("19345-49999", "12000-64000");
+                    command(NFT, &["-f", "-"], Some(&legacy)).unwrap();
+                }
+                assert!(!installed(uid, backend, &policy.blocked_networks()).unwrap());
+                apply_policy(uid, backend, &restored).unwrap();
+            }
             assert!(installed(uid, backend, &policy.blocked_networks()).unwrap());
             for (index, host) in hosts.iter().enumerate() {
                 let denied = if policy.strict {
@@ -787,7 +842,10 @@ mod tests {
                 } else {
                     iteration == 1 && index == 3
                 };
-                for port in [11999, 12000, 29503, 43422, 64000, 64001] {
+                for port in [
+                    1541, 11999, 12000, 19293, 19294, 19344, 19345, 29503, 43422, 49999, 50000,
+                    50032, 50033, 64000, 64001, 65535,
+                ] {
                     let target = if host.contains(':') {
                         format!("[{host}]:{port}")
                     } else {
@@ -803,7 +861,8 @@ mod tests {
                         "0.0.0.0:0"
                     })
                     .unwrap();
-                    let reject = denied && (12000..=64000).contains(&port);
+                    let reject =
+                        denied && matches!(port, 12000 | 19293 | 19345 | 29503 | 43422 | 49999);
                     assert_eq!(
                         socket.send_to(&[1], &target).is_err(),
                         reject,
@@ -817,9 +876,9 @@ mod tests {
                     );
                 }
                 let addr = if host.contains(':') {
-                    format!("[{host}]:35000")
+                    format!("[{host}]:443")
                 } else {
-                    format!("{host}:35000")
+                    format!("{host}:443")
                 };
                 let listener = std::net::TcpListener::bind(&addr).unwrap();
                 assert!(
@@ -904,9 +963,22 @@ mod tests {
             "wrong-uid",
             "missing-hook",
             "accept-instead-of-reject",
+            "legacy-ports",
+            "extra-legacy-rule",
             "missing-address",
         ] {
             let mut broken = document.clone();
+            if fault == "extra-legacy-rule" {
+                let mut rule = broken["nftables"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|o| o.get("rule").is_some())
+                    .unwrap()
+                    .clone();
+                rule["rule"]["expr"][2]["match"]["right"] = json!({"range":[12000,64000]});
+                broken["nftables"].as_array_mut().unwrap().push(rule);
+            }
             for obj in broken["nftables"].as_array_mut().unwrap() {
                 if obj.get("set").is_some() && obj["set"]["name"] == "blocked4" {
                     if fault == "missing-set" {
@@ -920,6 +992,9 @@ mod tests {
                     obj["chain"]["hook"] = "input".into();
                 }
                 if obj.get("rule").is_some() {
+                    if fault == "legacy-ports" {
+                        obj["rule"]["expr"][2]["match"]["right"] = json!({"range":[12000,64000]});
+                    }
                     if fault == "wrong-uid" {
                         obj["rule"]["expr"][0]["match"]["right"] = 1001.into();
                     }
@@ -959,7 +1034,10 @@ mod tests {
                 (11999, false),
                 (12000, true),
                 (35000, true),
-                (64000, true),
+                (19294, false),
+                (19344, false),
+                (50000, false),
+                (64000, false),
                 (64001, false),
             ] {
                 let sock =
