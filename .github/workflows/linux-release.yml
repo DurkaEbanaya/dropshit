@@ -14,12 +14,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y nftables iptables iproute2
+      - run: cargo test --locked --bin dropshit-helper --no-run
       - name: Discord exceptions and old-rule migration in isolated networks
         run: |
-          sudo unshare --net env PATH="$PATH" HOME="$HOME" DROPSHIT_KERNEL_PACKET_TEST=1 \
-            cargo test --locked --bin dropshit-helper strict_policy_packets -- --nocapture
-          sudo unshare --net env PATH="$PATH" HOME="$HOME" DROPSHIT_KERNEL_IPTABLES=1 \
-            cargo test --locked --bin dropshit-helper strict_policy_packets -- --nocapture
+          sudo unshare --net env PATH="$PATH" HOME="$HOME" CARGO_HOME="$CARGO_HOME" DROPSHIT_KERNEL_PACKET_TEST=1 \
+            cargo test --offline --locked --bin dropshit-helper strict_policy_packets -- --nocapture
+          sudo unshare --net env PATH="$PATH" HOME="$HOME" CARGO_HOME="$CARGO_HOME" DROPSHIT_KERNEL_IPTABLES=1 \
+            cargo test --offline --locked --bin dropshit-helper strict_policy_packets -- --nocapture
 
   build:
     runs-on: ubuntu-24.04
